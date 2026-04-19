@@ -52,7 +52,7 @@ type dashboardData struct {
 
 func (h *DashboardHandler) index0(w http.ResponseWriter, r *http.Request) {
 	var all []*tasks.Task
-	if h.Cfg.Boards != nil {
+	if h.Tasks != nil && h.Cfg.Boards != nil {
 		for _, b := range h.Cfg.Boards.Boards {
 			list, err := h.Tasks.ListByBoard(r.Context(), b.ID)
 			if err != nil {
@@ -79,6 +79,10 @@ type taskData struct {
 }
 
 func (h *DashboardHandler) taskPage(w http.ResponseWriter, r *http.Request) {
+	if h.Tasks == nil {
+		http.Error(w, "task store not configured", 503)
+		return
+	}
 	id := mux.Vars(r)["id"]
 	t, err := h.Tasks.Get(r.Context(), id)
 	if err != nil {

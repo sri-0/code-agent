@@ -35,6 +35,10 @@ func (h *APIHandler) Mount(r *mux.Router) {
 }
 
 func (h *APIHandler) listTasks(w http.ResponseWriter, r *http.Request) {
+	if h.Tasks == nil {
+		writeJSON(w, 200, map[string]any{"count": 0, "tasks": []any{}})
+		return
+	}
 	boardFilter := r.URL.Query().Get("board")
 	stageFilter := r.URL.Query().Get("stage")
 	ctx := r.Context()
@@ -77,6 +81,10 @@ func (h *APIHandler) listTasks(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *APIHandler) getTask(w http.ResponseWriter, r *http.Request) {
+	if h.Tasks == nil {
+		writeErr(w, 503, errStr("task store not configured"))
+		return
+	}
 	id := mux.Vars(r)["id"]
 	t, err := h.Tasks.Get(r.Context(), id)
 	if err != nil {
@@ -91,6 +99,10 @@ func (h *APIHandler) getTask(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *APIHandler) cancelTask(w http.ResponseWriter, r *http.Request) {
+	if h.Tasks == nil {
+		writeErr(w, 503, errStr("task store not configured"))
+		return
+	}
 	id := mux.Vars(r)["id"]
 	t, err := h.Tasks.Get(r.Context(), id)
 	if err != nil {

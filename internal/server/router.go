@@ -45,8 +45,10 @@ func NewRouter(d Deps) http.Handler {
 		}).Methods(http.MethodPost)
 	}
 
-	// Operator API — JSON.
-	if d.Cfg != nil && d.Tasks != nil {
+	// Operator API + dashboard. Mounted whenever we have config; handlers
+	// degrade gracefully when Tasks/Transcript are nil (e.g. valkey down in
+	// local dev) so /api/boards and the dashboard skeleton still work.
+	if d.Cfg != nil {
 		api := r.PathPrefix("/api").Subrouter()
 		(&handler.APIHandler{
 			Cfg:        d.Cfg,

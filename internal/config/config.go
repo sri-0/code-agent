@@ -34,11 +34,11 @@ type Config struct {
 	OpenCodeURL      string `env:"OPENCODE_URL,default=http://localhost:4096"`
 	OpenCodePassword string `env:"OPENCODE_SERVER_PASSWORD"`
 
-	// Attached after YAML load.
-	Boards   *BoardsConfig   `env:"-"`
-	Stages   *StagesConfig   `env:"-"`
-	Runtimes *RuntimesConfig `env:"-"`
-	OpenCode *OpenCodeConfig `env:"-"`
+	// Attached after YAML load. No env tag — envconfig leaves them alone.
+	Boards   *BoardsConfig
+	Stages   *StagesConfig
+	Runtimes *RuntimesConfig
+	OpenCode *OpenCodeConfig
 }
 
 // Load reads env vars; call LoadYAML afterwards to populate the YAML fields.
