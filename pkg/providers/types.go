@@ -68,6 +68,10 @@ type BoardProvider interface {
 	// tickets it parks (e.g. "needs-more-info"). Idempotent: attaching an
 	// already-present tag should not error.
 	AddTag(ctx context.Context, externalID, tag string) error
+	// UpdateDescription replaces the ticket's description body with the
+	// given markdown. The orchestrator uses this to write agent plans
+	// back onto the ticket at the end of the plan stage.
+	UpdateDescription(ctx context.Context, externalID, body string) error
 
 	// HandleWebhook validates and parses a webhook request, emitting any
 	// resulting events on out. Implementations write the HTTP response.

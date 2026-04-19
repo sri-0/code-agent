@@ -27,9 +27,15 @@ type Stage struct {
 	SuccessNext string       `yaml:"success_next,omitempty"`
 	FailureNext string       `yaml:"failure_next,omitempty"`
 	Terminal   bool          `yaml:"terminal,omitempty"`
-	Timeout    time.Duration `yaml:"timeout,omitempty"`
-	MaxRetries int           `yaml:"max_retries,omitempty"`
-	MRTemplate string        `yaml:"mr_template,omitempty"` // for action=open_mr
+	// HumanReview, when true, tells the engine to skip the automatic
+	// transition to success_next on completion. The stage behaves as
+	// terminal — a human must move the ticket to the next status manually.
+	// Used to gate the plan -> implement transition so a human can approve
+	// the plan first.
+	HumanReview bool          `yaml:"human_review,omitempty"`
+	Timeout     time.Duration `yaml:"timeout,omitempty"`
+	MaxRetries  int           `yaml:"max_retries,omitempty"`
+	MRTemplate  string        `yaml:"mr_template,omitempty"` // for action=open_mr
 }
 
 func LoadStages(path string) (*StagesConfig, error) {

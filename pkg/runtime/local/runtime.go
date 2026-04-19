@@ -83,22 +83,20 @@ func (r *Runtime) EnsureWorker(ctx context.Context, t *tasks.Task, _ config.Boar
 }
 
 // EnsureSession creates a new opencode session if the task doesn't have one
-// yet, otherwise returns the cached session id.
+// yet, otherwise returns the cached session id. The task's stored SessionID
+// is authoritative — if empty, we treat any in-memory cache as stale (the
+// engine clears SessionID between stages so each stage gets a fresh
+// opencode session).
 func (r *Runtime) EnsureSession(ctx context.Context, client *opencode.Client, t *tasks.Task) (string, error) {
-	r.mu.Lock()
-	if sid, ok := r.sessions[t.ID]; ok {
-		r.mu.Unlock()
-		return sid, nil
-	}
-	r.mu.Unlock()
-
 	if t.SessionID != "" {
-		// task remembers a session from a previous run; trust it
 		r.mu.Lock()
 		r.sessions[t.ID] = t.SessionID
 		r.mu.Unlock()
 		return t.SessionID, nil
 	}
+	r.mu.Lock()
+	delete(r.sessions, t.ID) // drop any stale cache entry from a prior stage
+	r.mu.Unlock()
 
 	title := t.ExternalID
 	if t.Title != "" {

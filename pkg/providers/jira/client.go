@@ -259,6 +259,34 @@ func (p *Provider) AddTag(ctx context.Context, externalID, tag string) error {
 	return p.http.Do(ctx, http.MethodPut, "/rest/api/3/issue/"+externalID, body, nil, nil)
 }
 
+// UpdateDescription replaces the Jira issue description with the given
+// body, rendered as ADF (Atlassian Document Format). We keep the ADF
+// conversion naive — split the body on newlines into paragraphs — which
+// loses rich markdown formatting but keeps the plan readable.
+func (p *Provider) UpdateDescription(ctx context.Context, externalID, body string) error {
+	// Build a trivial ADF doc: one paragraph per non-empty line.
+	content := []any{}
+	for _, para := range strings.Split(body, "\n") {
+		if strings.TrimSpace(para) == "" {
+			continue
+		}
+		content = append(content, map[string]any{
+			"type":    "paragraph",
+			"content": []any{map[string]any{"type": "text", "text": para}},
+		})
+	}
+	req := map[string]any{
+		"fields": map[string]any{
+			"description": map[string]any{
+				"type":    "doc",
+				"version": 1,
+				"content": content,
+			},
+		},
+	}
+	return p.http.Do(ctx, http.MethodPut, "/rest/api/3/issue/"+externalID, req, nil, nil)
+}
+
 // urlQuery is a minimal escaper for the JQL query string. We keep it local to
 // avoid pulling in net/url for a single call site.
 func urlQuery(s string) string {

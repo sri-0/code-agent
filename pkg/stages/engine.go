@@ -61,15 +61,41 @@ type Engine struct {
 
 	mu      sync.RWMutex
 	runners map[string]ActionRunner
+
+	// inFlight tracks tasks that have a running action so repeated poll
+	// events don't start a parallel run. In-memory: cleared on restart,
+	// which is the right behaviour (a crashed orchestrator forgets its
+	// locks and re-tries the task from scratch).
+	flightMu sync.Mutex
+	inFlight map[string]struct{}
 }
 
 func NewEngine(cfg *config.Config, logger zerolog.Logger, store tasks.Store) *Engine {
 	return &Engine{
-		cfg:     cfg,
-		logger:  logger.With().Str("component", "stages").Logger(),
-		store:   store,
-		runners: map[string]ActionRunner{},
+		cfg:      cfg,
+		logger:   logger.With().Str("component", "stages").Logger(),
+		store:    store,
+		runners:  map[string]ActionRunner{},
+		inFlight: map[string]struct{}{},
 	}
+}
+
+// tryAcquire marks a task as running an action; returns false if one is
+// already in flight.
+func (e *Engine) tryAcquire(taskID string) bool {
+	e.flightMu.Lock()
+	defer e.flightMu.Unlock()
+	if _, busy := e.inFlight[taskID]; busy {
+		return false
+	}
+	e.inFlight[taskID] = struct{}{}
+	return true
+}
+
+func (e *Engine) release(taskID string) {
+	e.flightMu.Lock()
+	defer e.flightMu.Unlock()
+	delete(e.inFlight, taskID)
 }
 
 // Register an action runner under a name (matches Stage.Action).
@@ -202,6 +228,15 @@ func (e *Engine) runAction(ctx context.Context, t *tasks.Task, b config.Board, s
 		return e.advance(ctx, t, b, stg, set, prov, "success")
 	}
 
+	// Prevent concurrent runs of the same task: a re-entered poll event
+	// while an action is already running would start a parallel (and
+	// destructive — sync wipes files) session.
+	if !e.tryAcquire(t.ID) {
+		e.logger.Debug().Str("task", t.ID).Str("stage", stg.Name).Msg("action already in flight; skipping re-entry")
+		return nil
+	}
+	defer e.release(t.ID)
+
 	timeout := stg.Timeout
 	if timeout == 0 {
 		timeout = 10 * time.Minute
@@ -270,6 +305,13 @@ func (e *Engine) advance(ctx context.Context, t *tasks.Task, b config.Board, stg
 	if stg.Terminal {
 		return nil
 	}
+	// Human-review gate: on success, park the task. Don't auto-transition
+	// the ticket; a human must move it forward manually. Failures still
+	// route to failure_next so errors aren't silenced.
+	if outcome == "success" && stg.HumanReview {
+		e.logger.Info().Str("task", t.ID).Str("stage", stg.Name).Msg("stage complete; human review required — parking")
+		return nil
+	}
 	var nextName string
 	switch outcome {
 	case "failure":
@@ -297,6 +339,10 @@ func (e *Engine) advance(ctx context.Context, t *tasks.Task, b config.Board, stg
 	t.Stage = next.Name
 	t.StageStarted = time.Now()
 	t.UpdatedAt = time.Now()
+	// Clear the cached opencode session id so the next stage starts with a
+	// fresh session. Each stage has its own system prompt; we don't want
+	// the plan-stage conversation leaking into the implement-stage turn.
+	t.SessionID = ""
 	if err := e.store.Update(ctx, t); err != nil {
 		return err
 	}

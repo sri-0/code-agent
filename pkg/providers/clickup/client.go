@@ -194,3 +194,11 @@ func (p *Provider) AddTag(ctx context.Context, externalID, tag string) error {
 	path := "/task/" + externalID + "/tag/" + url.PathEscape(tag)
 	return p.http.Do(ctx, http.MethodPost, path, nil, nil, nil)
 }
+
+// UpdateDescription replaces the task body with the given markdown string.
+// ClickUp stores description as plain markdown in the "description" field;
+// PUT /task/{id} with {"description": "..."} overwrites it.
+func (p *Provider) UpdateDescription(ctx context.Context, externalID, body string) error {
+	req := map[string]any{"description": body}
+	return p.http.Do(ctx, http.MethodPut, "/task/"+externalID, req, nil, nil)
+}

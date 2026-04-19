@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -65,6 +68,19 @@ func (r *AgentRunner) Run(ctx context.Context, in stages.ActionInput) (stages.Ac
 	}
 	in.Task.WorkerRef = *ref
 	in.Task.RuntimeMode = rt.Mode()
+
+	// For local runtime: sync each repo to its configured base_branch
+	// before handing off to the agent. We fetch, hard-reset, and check out
+	// so every run starts from a clean known baseline. k8s runtimes do
+	// their own cloning via cmd/runner, so skip there.
+	if rt.Mode() == "local" {
+		syncCtx, cancelSync := context.WithTimeout(ctx, 3*time.Minute)
+		if err := syncLocalRepos(syncCtx, client, in); err != nil {
+			cancelSync()
+			return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("sync repos: %w", err)
+		}
+		cancelSync()
+	}
 
 	sessionID, err := rt.EnsureSession(ctx, client, in.Task)
 	if err != nil {
@@ -140,6 +156,18 @@ func (r *AgentRunner) Run(ctx context.Context, in stages.ActionInput) (stages.Ac
 				},
 			}, nil
 		}
+		// If the agent emitted a PLAN_START/PLAN_END block, write it to
+		// the ticket description so the next stage (and any human
+		// reviewer) has the plan as the source of truth.
+		if plan, ok := parsePlan(lastText); ok {
+			newDesc := formatPlanDescription(in.Task, plan)
+			in.Logger.Info().Int("bytes", len(newDesc)).Msg("updating ticket description with plan")
+			descCtx, cancelDesc := context.WithTimeout(context.Background(), 15*time.Second)
+			if err := in.Provider.UpdateDescription(descCtx, in.Task.ExternalID, newDesc); err != nil {
+				in.Logger.Error().Err(err).Msg("failed to update ticket description")
+			}
+			cancelDesc()
+		}
 		return stages.ActionResult{
 			Outcome: outcome,
 			Mutate: func(t *tasks.Task) {
@@ -149,6 +177,49 @@ func (r *AgentRunner) Run(ctx context.Context, in stages.ActionInput) (stages.Ac
 			},
 		}, nil
 	}
+}
+
+// parsePlan extracts the markdown between PLAN_START / PLAN_END sentinel
+// lines. Returns the inner text and true on success. Both sentinels must
+// appear on their own lines.
+func parsePlan(text string) (string, bool) {
+	startIdx := strings.Index(text, "PLAN_START")
+	if startIdx < 0 {
+		return "", false
+	}
+	// advance past the PLAN_START line
+	nl := strings.IndexByte(text[startIdx:], '\n')
+	if nl < 0 {
+		return "", false
+	}
+	bodyStart := startIdx + nl + 1
+	rest := text[bodyStart:]
+	endIdx := strings.Index(rest, "PLAN_END")
+	if endIdx < 0 {
+		return "", false
+	}
+	return strings.TrimSpace(rest[:endIdx]), true
+}
+
+// formatPlanDescription builds the new ticket description: an "Agent plan"
+// header, the plan body, and the original description preserved below a
+// divider so ticket authors don't lose what they wrote.
+func formatPlanDescription(t *tasks.Task, plan string) string {
+	var b strings.Builder
+	b.WriteString("🤖 **Agent plan** — generated ")
+	b.WriteString(time.Now().UTC().Format("2006-01-02 15:04 UTC"))
+	b.WriteString(" for ")
+	b.WriteString(t.ExternalID)
+	b.WriteString("\n\n")
+	b.WriteString(plan)
+	b.WriteString("\n\n---\n\n")
+	b.WriteString("### Original ticket description\n\n")
+	if strings.TrimSpace(t.Description) == "" {
+		b.WriteString("_(empty)_")
+	} else {
+		b.WriteString(t.Description)
+	}
+	return b.String()
 }
 
 // parseNeedsMoreInfo returns the reason and true if the assistant's final
@@ -219,6 +290,47 @@ func (r *AgentRunner) consumeStream(ctx context.Context, sessionID string, event
 			}
 		}
 	}
+}
+
+// syncLocalRepos fetches + hard-resets + checks out each repo on its
+// base_branch in the opencode worktree. Destructive: any uncommitted work
+// in those trees is wiped — by design, each run starts from a clean base.
+// Repos whose directory is missing or not a git checkout are skipped with
+// a warning (not an error).
+func syncLocalRepos(ctx context.Context, client *opencode.Client, in stages.ActionInput) error {
+	project, err := client.CurrentProject(ctx)
+	if err != nil {
+		return fmt.Errorf("get current project: %w", err)
+	}
+	root := project.Worktree
+	if root == "" || root == "/" {
+		return fmt.Errorf("opencode has no workspace worktree (got %q); start it inside a git-initialised parent dir", root)
+	}
+	for _, r := range in.Task.Repos {
+		dir := filepath.Join(root, r.Name)
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err != nil {
+			in.Logger.Warn().Str("repo", r.Name).Str("dir", dir).Msg("repo dir not a git checkout; skipping sync")
+			continue
+		}
+		branch := r.BaseBranch
+		if branch == "" {
+			branch = "main"
+		}
+		steps := [][]string{
+			{"fetch", "--quiet", "origin", branch},
+			{"checkout", "-B", branch, "origin/" + branch},
+			{"reset", "--hard", "origin/" + branch},
+		}
+		for _, args := range steps {
+			full := append([]string{"-C", dir}, args...)
+			cmd := exec.CommandContext(ctx, "git", full...)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				return fmt.Errorf("repo %s: git %s: %w (%s)", r.Name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+			}
+		}
+		in.Logger.Info().Str("repo", r.Name).Str("branch", branch).Msg("repo synced to base_branch")
+	}
+	return nil
 }
 
 func composeUserMessage(t *tasks.Task) string {
