@@ -1,36 +1,68 @@
 boards:
-  - id: proj-alpha
-    provider: jira
-    url: https://prism.atlassian.net
-    project_key: ALPHA
+  - id: prism-main
+    provider: clickup
+    url: https://app.clickup.com
+    # Team (workspace) id — from your URL: app.clickup.com/6905220/...
+    workspace_id: "6905220"
+    # List IDs — fill in after running the lookup (see README). Strings,
+    # not ints: ClickUp IDs can exceed 32-bit.
+    list_ids:
+      - "REPLACE_WITH_LIST_ID"
     auth:
-      env: JIRA_TOKEN_ALPHA
+      env: CLICKUP_TOKEN
     filters:
-      labels:
+      # Only pick up tasks tagged with this. Create the tag in ClickUp and
+      # add it to any card you want the agent to touch. Remove the block
+      # if you want the agent to consider every task in the list.
+      tags:
         - ai-agent
-      exclude_labels:
-        - blocked
     triggers:
       webhook:
-        enabled: true
-        secret:
-          env: JIRA_WEBHOOK_SECRET_ALPHA
+        enabled: false
       poll:
         enabled: true
-        interval: 5m
+        interval: 30s
     stages_ref: default
-    runtime_ref: default
+    runtime_ref: local
+    # The orchestrator tracks all 5 repos — open_mr will branch + PR
+    # against whichever ones the agent actually touched. In local mode
+    # you'll run `opencode serve` in a parent dir that contains all five
+    # so the agent can cd into any of them.
     repos:
-      - name: api
-        url: git@gitlab.com:prism/alpha-api.git
+      - name: risky-api-core
+        url: https://github.com/prism-au/risky-api-core.git
         base_branch: main
         vcs:
-          provider: gitlab
-          host: gitlab.com
+          provider: github
+          host: github.com
           auth:
-            env: GITLAB_BOT_TOKEN
-      - name: ui
-        url: git@github.com:prism/alpha-ui.git
+            env: GITHUB_BOT_TOKEN
+      - name: risky-live-app
+        url: https://github.com/prism-au/risky-live-app.git
+        base_branch: main
+        vcs:
+          provider: github
+          host: github.com
+          auth:
+            env: GITHUB_BOT_TOKEN
+      - name: accounts-svc
+        url: https://github.com/prism-au/accounts-svc.git
+        base_branch: main
+        vcs:
+          provider: github
+          host: github.com
+          auth:
+            env: GITHUB_BOT_TOKEN
+      - name: risky-assess-web
+        url: https://github.com/prism-au/risky-assess-web.git
+        base_branch: main
+        vcs:
+          provider: github
+          host: github.com
+          auth:
+            env: GITHUB_BOT_TOKEN
+      - name: risky-live-native
+        url: https://github.com/prism-au/risky-live-native.git
         base_branch: main
         vcs:
           provider: github
