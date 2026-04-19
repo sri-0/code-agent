@@ -16,31 +16,60 @@ import (
 	"code-agent/internal/config"
 	"code-agent/pkg/providers"
 	_ "code-agent/pkg/providers/all" // register providers
+	"code-agent/pkg/runtime"
+	_ "code-agent/pkg/runtime/all" // register runtimes
 	"code-agent/pkg/stages"
 	"code-agent/pkg/tasks"
+	"code-agent/pkg/transcript"
 )
 
 type Orchestrator struct {
 	cfg    *config.Config
 	logger zerolog.Logger
 	tasks  tasks.Store
+	tx     transcript.Store
 	disp   *providers.Dispatcher
 	engine *stages.Engine
+
+	runtimes    map[string]runtime.Runtime
+	agentRunner *runtime.AgentRunner
 
 	// boardByID lets webhook handlers route to the right provider.
 	mu        sync.RWMutex
 	boardByID map[string]providers.BoardProvider
 }
 
-func New(cfg *config.Config, logger zerolog.Logger, taskStore tasks.Store) (*Orchestrator, error) {
+func New(cfg *config.Config, logger zerolog.Logger, taskStore tasks.Store, tx transcript.Store) (*Orchestrator, error) {
 	o := &Orchestrator{
 		cfg:       cfg,
 		logger:    logger.With().Str("component", "orchestrator").Logger(),
 		tasks:     taskStore,
+		tx:        tx,
 		disp:      providers.NewDispatcher(256, 5*time.Minute, logger),
 		engine:    stages.NewEngine(cfg, logger, taskStore),
+		runtimes:  map[string]runtime.Runtime{},
 		boardByID: map[string]providers.BoardProvider{},
 	}
+
+	// Build runtimes (each name in runtime.yaml -> instance).
+	if cfg.Runtimes != nil {
+		for name, rcfg := range cfg.Runtimes.Runtimes {
+			rt, err := runtime.Build(name, rcfg, runtime.Deps{
+				Logger:     o.logger,
+				Transcript: tx,
+			})
+			if err != nil {
+				o.logger.Error().Err(err).Str("runtime", name).Msg("failed to build runtime")
+				continue
+			}
+			o.runtimes[name] = rt
+			o.logger.Info().Str("runtime", name).Str("mode", rcfg.Mode).Msg("runtime registered")
+		}
+	}
+
+	// Wire the run_agent action runner.
+	o.agentRunner = runtime.NewAgentRunner(o.runtimes, tx)
+	o.engine.Register("run_agent", o.agentRunner)
 
 	if cfg.Boards == nil {
 		o.logger.Warn().Msg("no boards configured; orchestrator idle")

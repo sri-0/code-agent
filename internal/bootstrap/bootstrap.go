@@ -13,6 +13,7 @@ import (
 	"code-agent/pkg/logging"
 	"code-agent/pkg/tasks"
 	tasksvalkey "code-agent/pkg/tasks/valkey"
+	"code-agent/pkg/transcript"
 
 	"github.com/joho/godotenv"
 	"github.com/rs/zerolog"
@@ -20,11 +21,12 @@ import (
 
 // Result holds everything produced by Init.
 type Result struct {
-	Cfg    *config.Config
-	Logger zerolog.Logger
-	Valkey *valkey.Valkey
-	Tasks  tasks.Store
-	Orch   *orchestrator.Orchestrator
+	Cfg        *config.Config
+	Logger     zerolog.Logger
+	Valkey     *valkey.Valkey
+	Tasks      tasks.Store
+	Transcript transcript.Store
+	Orch       *orchestrator.Orchestrator
 }
 
 // Init loads env + YAML config, initialises logging, connects to valkey and
@@ -62,6 +64,7 @@ func Init(ctx context.Context) (*Result, error) {
 
 	var vk *valkey.Valkey
 	var taskStore tasks.Store
+	var txStore transcript.Store
 	if cfg.Valkey != nil {
 		v, err := valkey.New(ctx, *cfg.Valkey)
 		if err != nil {
@@ -69,19 +72,21 @@ func Init(ctx context.Context) (*Result, error) {
 		} else {
 			vk = v
 			taskStore = tasksvalkey.New(vk)
+			txStore = transcript.NewValkey(vk)
 		}
 	}
 
-	orch, err := orchestrator.New(cfg, logger, taskStore)
+	orch, err := orchestrator.New(cfg, logger, taskStore, txStore)
 	if err != nil {
 		return nil, fmt.Errorf("orchestrator: %w", err)
 	}
 
 	return &Result{
-		Cfg:    cfg,
-		Logger: logger,
-		Valkey: vk,
-		Tasks:  taskStore,
-		Orch:   orch,
+		Cfg:        cfg,
+		Logger:     logger,
+		Valkey:     vk,
+		Tasks:      taskStore,
+		Transcript: txStore,
+		Orch:       orch,
 	}, nil
 }
