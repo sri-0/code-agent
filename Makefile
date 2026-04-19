@@ -1,4 +1,4 @@
-.PHONY: server dev-local dev-k8s cli build test tidy docker fmt vet minikube-up minikube-down
+.PHONY: server dev-local dev-k8s cli build test tidy docker docker-worker fmt vet minikube-up minikube-down
 
 # Production server entry
 server:
@@ -38,6 +38,10 @@ vet:
 # Docker image for the orchestrator
 docker:
 	docker build -t code-agent:dev .
+
+# Docker image for the opencode worker pod (packs cmd/runner + opencode CLI)
+docker-worker:
+	docker build -f docker/opencode/Dockerfile -t code-agent-worker:dev .
 
 # --- Minikube helpers ---
 minikube-up:
