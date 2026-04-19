@@ -43,11 +43,17 @@ type Event struct {
 	RawJSON    string         `json:"-"` // original line for transcript
 }
 
-// IsTerminal returns true for events that mark the end of a model turn,
-// meaning the orchestrator should stop waiting on this prompt.
+// IsTerminal returns true for events that mark the session as fully done
+// with the current prompt — i.e. no more work in flight, safe for the
+// orchestrator to read the final assistant message.
+//
+// Intentionally does NOT include "message.completed": opencode emits that
+// after every assistant turn, including ones that are about to kick off
+// tool calls that will produce further assistant messages. Relying on it
+// made us grab the wrong "final" message for plan extraction.
 func (e Event) IsTerminal() bool {
 	switch e.Type {
-	case "message.completed", "session.idle", "session.error":
+	case "session.idle", "session.error":
 		return true
 	}
 	return false
