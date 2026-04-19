@@ -1,0 +1,10 @@
+bin/
+.env
+.env.local
+.workspaces/
+*.out
+*.test
+.DS_Store
+coverage.*
+.idea/
+.vscode/

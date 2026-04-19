@@ -1,0 +1,41 @@
+boards:
+  - id: proj-alpha
+    provider: jira
+    url: https://prism.atlassian.net
+    project_key: ALPHA
+    auth:
+      env: JIRA_TOKEN_ALPHA
+    filters:
+      labels:
+        - ai-agent
+      exclude_labels:
+        - blocked
+    triggers:
+      webhook:
+        enabled: true
+        secret:
+          env: JIRA_WEBHOOK_SECRET_ALPHA
+      poll:
+        enabled: true
+        interval: 5m
+    stages_ref: default
+    runtime_ref: default
+    repos:
+      - name: api
+        url: git@gitlab.com:prism/alpha-api.git
+        base_branch: main
+        vcs:
+          provider: gitlab
+          host: gitlab.com
+          auth:
+            env: GITLAB_BOT_TOKEN
+      - name: ui
+        url: git@github.com:prism/alpha-ui.git
+        base_branch: main
+        vcs:
+          provider: github
+          host: github.com
+          auth:
+            env: GITHUB_BOT_TOKEN
+    branch_prefix: ai/
+    mr_strategy: per_repo_cross_linked

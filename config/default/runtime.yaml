@@ -1,0 +1,32 @@
+runtimes:
+  default:
+    mode: ephemeral
+    namespace: code-agent
+    image: ghcr.io/your-org/code-agent-worker:latest
+    idle_timeout: 2h
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        cpu: "2"
+        memory: 4Gi
+    ingress:
+      enabled: true
+      host_template: task-{{.TaskID}}.opencode.internal
+      tls_secret: opencode-wildcard
+
+  local:
+    mode: local
+    opencode_url: http://localhost:4096
+    opencode_password:
+      env: OPENCODE_SERVER_PASSWORD
+    workdir: ./.workspaces
+
+  shared:
+    mode: shared
+    namespace: code-agent
+    image: ghcr.io/your-org/code-agent-worker:latest
+    ingress:
+      enabled: true
+      host_template: "{{.BoardID}}.opencode.internal"

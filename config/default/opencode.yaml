@@ -1,0 +1,29 @@
+default:
+  permissions:
+    edit: allow
+    bash: ask
+    write: allow
+  tools:
+    enabled:
+      - edit
+      - read
+      - write
+      - bash
+      - grep
+      - glob
+  folders:
+    allowed:
+      - /workspace
+    denied:
+      - /workspace/.git/hooks
+  providers:
+    anthropic:
+      model: claude-opus-4-7
+
+overrides:
+  in_progress:
+    permissions:
+      bash: allow
+  test:
+    permissions:
+      bash: allow

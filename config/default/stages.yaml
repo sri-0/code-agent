@@ -1,0 +1,50 @@
+stage_sets:
+  default:
+    - name: todo
+      provider_status: To Do
+      action: noop
+      next: in_progress
+
+    - name: in_progress
+      provider_status: In Progress
+      action: run_agent
+      timeout: 45m
+      success_next: test
+      failure_next: blocked
+      system_prompt: |
+        You are implementing ticket {{.TicketID}}: {{.Title}}.
+
+        Description:
+        {{.Description}}
+
+        Acceptance criteria:
+        {{.AcceptanceCriteria}}
+
+        The following repositories are checked out:
+        {{range .Repos}}- {{.Name}} at {{.Path}} (branch {{.Branch}})
+        {{end}}
+
+        Make the minimal set of changes across the relevant repositories.
+        Do NOT commit or push; the orchestrator will handle git operations.
+        Do NOT open the merge request; that is also handled outside.
+
+    - name: test
+      provider_status: Testing
+      action: run_agent
+      max_retries: 2
+      success_next: ready_for_qa
+      failure_next: in_progress
+      system_prompt: |
+        Run the full test suite across all modified repositories.
+        Fix any failures you caused. When everything passes, write a short
+        summary of what was changed and what was tested.
+
+    - name: ready_for_qa
+      provider_status: Ready for QA
+      action: open_mr
+      terminal: true
+
+    - name: blocked
+      provider_status: Blocked
+      action: comment_error
+      terminal: true

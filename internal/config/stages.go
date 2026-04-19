@@ -1,0 +1,74 @@
+package config
+
+import (
+	"fmt"
+	"os"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+type StagesConfig struct {
+	StageSets map[string][]Stage `yaml:"stage_sets"`
+}
+
+type Stage struct {
+	Name           string        `yaml:"name"`
+	ProviderStatus string        `yaml:"provider_status"`
+	Action         string        `yaml:"action"`                 // noop | run_agent | open_mr | comment | comment_error | wait_for_review | run_shell
+	RuntimeMode    string        `yaml:"runtime_mode,omitempty"` // override runtime for this stage
+	SystemPrompt   string        `yaml:"system_prompt,omitempty"`
+	Next           string        `yaml:"next,omitempty"` // for action=noop
+	SuccessNext    string        `yaml:"success_next,omitempty"`
+	FailureNext    string        `yaml:"failure_next,omitempty"`
+	Terminal       bool          `yaml:"terminal,omitempty"`
+	Timeout        time.Duration `yaml:"timeout,omitempty"`
+	MaxRetries     int           `yaml:"max_retries,omitempty"`
+	MRTemplate     string        `yaml:"mr_template,omitempty"` // for action=open_mr
+}
+
+func LoadStages(path string) (*StagesConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var cfg StagesConfig
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parse yaml: %w", err)
+	}
+	return &cfg, nil
+}
+
+// Set returns a stage set by name.
+func (c *StagesConfig) Set(name string) ([]Stage, bool) {
+	s, ok := c.StageSets[name]
+	return s, ok
+}
+
+// StageByName returns a stage within a set.
+func (c *StagesConfig) StageByName(setName, stageName string) (Stage, bool) {
+	set, ok := c.Set(setName)
+	if !ok {
+		return Stage{}, false
+	}
+	for _, s := range set {
+		if s.Name == stageName {
+			return s, true
+		}
+	}
+	return Stage{}, false
+}
+
+// StageByProviderStatus finds the stage a given provider status maps to.
+func (c *StagesConfig) StageByProviderStatus(setName, providerStatus string) (Stage, bool) {
+	set, ok := c.Set(setName)
+	if !ok {
+		return Stage{}, false
+	}
+	for _, s := range set {
+		if s.ProviderStatus == providerStatus {
+			return s, true
+		}
+	}
+	return Stage{}, false
+}
