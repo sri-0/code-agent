@@ -52,6 +52,26 @@ func (r *Runtime) EnsureWorker(ctx context.Context, t *tasks.Task, _ config.Boar
 			return nil, nil, fmt.Errorf("local runtime: opencode not reachable at %s: %w", r.cfg.OpenCodeURL, err)
 		}
 		r.logger.Info().Str("url", r.cfg.OpenCodeURL).Msg("local runtime: connected to opencode")
+
+		// Best-effort: ensure opencode's current worktree is a git repo, so
+		// its project picker assigns a real hash id. If the result is still
+		// "global" the user needs to restart opencode for the new project to
+		// be registered (this is an opencode startup quirk, not fixable via
+		// API). Non-fatal — we warn and continue.
+		if p, err := r.client.EnsureGitProject(ctx); err != nil {
+			r.logger.Warn().Err(err).Msg("local runtime: could not init project; sessions may be orphaned")
+		} else {
+			if p.ID == "global" {
+				r.logger.Warn().
+					Str("worktree", p.Worktree).
+					Msg("local runtime: opencode project is still 'global' — sessions won't show in the UI's project picker. Make sure opencode was started inside an existing git repo (with at least one commit).")
+			} else {
+				r.logger.Info().
+					Str("project_id", p.ID).
+					Str("worktree", p.Worktree).
+					Msg("local runtime: opencode project ready")
+			}
+		}
 	}
 	ref := &tasks.WorkerRef{
 		Mode:     "local",

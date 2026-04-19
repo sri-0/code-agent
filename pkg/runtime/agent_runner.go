@@ -86,12 +86,13 @@ func (r *AgentRunner) Run(ctx context.Context, in stages.ActionInput) (stages.Ac
 
 	// Compose user message: include the ticket so the model has context.
 	userMsg := composeUserMessage(in.Task)
-	postCtx, postCancel := context.WithTimeout(ctx, 30*time.Second)
-	err = client.PostMessage(postCtx, sessionID, opencode.PostMessageRequest{
+	// POST /session/{id}/message on opencode is synchronous — it blocks
+	// until the model finishes. Use the action ctx (stage.Timeout, ~45m)
+	// as the bound rather than a 30s wrap.
+	err = client.PostMessage(ctx, sessionID, opencode.PostMessageRequest{
 		System: in.Stage.SystemPrompt,
 		Parts:  []opencode.MessagePart{{Type: "text", Text: userMsg}},
 	})
-	postCancel()
 	if err != nil {
 		streamCancel()
 		return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("post message: %w", err)

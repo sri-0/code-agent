@@ -28,7 +28,11 @@ type Options struct {
 
 func New(opts Options, logger zerolog.Logger) *Client {
 	if opts.Timeout == 0 {
-		opts.Timeout = 60 * time.Second
+		// opencode's POST /session/{id}/message blocks until the model
+		// finishes — which is many minutes for real tasks. Use 30m as a
+		// generous cap; the action-level timeout (stage.Timeout) bounds
+		// it tighter in practice.
+		opts.Timeout = 30 * time.Minute
 	}
 	headers := map[string]string{}
 	if opts.Password != "" {
@@ -62,6 +66,36 @@ func (c *Client) AuthHeader() string {
 // Health pings the server's /app endpoint as a liveness check.
 func (c *Client) Health(ctx context.Context) error {
 	return c.http.Do(ctx, http.MethodGet, "/app", nil, nil, nil)
+}
+
+// Project mirrors the subset of opencode's project shape we need.
+type Project struct {
+	ID       string `json:"id"`
+	Worktree string `json:"worktree"`
+	VCS      string `json:"vcs"`
+}
+
+// CurrentProject returns the project opencode has active.
+func (c *Client) CurrentProject(ctx context.Context) (*Project, error) {
+	var p Project
+	if err := c.http.Do(ctx, http.MethodGet, "/project/current", nil, &p, nil); err != nil {
+		return nil, fmt.Errorf("get current project: %w", err)
+	}
+	return &p, nil
+}
+
+// EnsureGitProject calls POST /project/git/init which runs `git init` in
+// opencode's current worktree. This is a no-op if the dir is already a git
+// repo. Returns the resulting project — if its id is "global" it means
+// opencode needs to be restarted for the new project entry to take effect
+// (opencode only registers a real hash-id'd project when it starts inside
+// an existing git repo).
+func (c *Client) EnsureGitProject(ctx context.Context) (*Project, error) {
+	var p Project
+	if err := c.http.Do(ctx, http.MethodPost, "/project/git/init", map[string]any{}, &p, nil); err != nil {
+		return nil, fmt.Errorf("project/git/init: %w", err)
+	}
+	return &p, nil
 }
 
 // CreateSession opens a new session and returns it.
