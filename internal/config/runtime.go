@@ -10,6 +10,15 @@ import (
 
 type RuntimesConfig struct {
 	Runtimes map[string]Runtime `yaml:"runtimes"`
+	// Git identity for commits made inside worker pods. Injected into
+	// the pod as CODE_AGENT_GIT_USER_NAME / CODE_AGENT_GIT_USER_EMAIL,
+	// which cmd/runner applies via `git config --global` at startup.
+	Git GitIdentity `yaml:"git,omitempty"`
+}
+
+type GitIdentity struct {
+	UserName  string `yaml:"user_name,omitempty"`
+	UserEmail string `yaml:"user_email,omitempty"`
 }
 
 type Runtime struct {

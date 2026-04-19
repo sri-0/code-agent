@@ -21,13 +21,16 @@ type MessagePart struct {
 	Text string `json:"text"`
 }
 
-// PostMessageRequest matches POST /session/{id}/message.
+// PostMessageRequest matches POST /session/{id}/message (and prompt_async).
 type PostMessageRequest struct {
-	ProviderID string        `json:"providerID,omitempty"`
-	ModelID    string        `json:"modelID,omitempty"`
-	Mode       string        `json:"mode,omitempty"`
-	System     string        `json:"system,omitempty"`
-	Parts      []MessagePart `json:"parts"`
+	ProviderID string `json:"providerID,omitempty"`
+	ModelID    string `json:"modelID,omitempty"`
+	// Agent selects which named opencode agent to run as for this turn
+	// (e.g. "build", "plan"). Opencode internally calls this "mode".
+	// Honoured by /prompt_async; ignored if empty.
+	Agent  string        `json:"agent,omitempty"`
+	System string        `json:"system,omitempty"`
+	Parts  []MessagePart `json:"parts"`
 }
 
 // Event is one decoded SSE event from GET /event.

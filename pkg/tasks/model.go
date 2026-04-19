@@ -17,6 +17,14 @@ type Task struct {
 	Stage        string    `json:"stage"` // current stage name
 	StageStarted time.Time `json:"stage_started"`
 	Retries      int       `json:"retries"`
+	// CompletedStages lists every stage this task has run to completion
+	// (terminal and non-terminal). The engine skips re-entry into any
+	// stage in this list so self-triggered ticket updates (updated_at
+	// bumps from description writes, tag adds, transitions) don't
+	// retrigger already-done work. A single run walks each stage once.
+	// Cleared by manual task cancel/delete — operators reset the task
+	// if they want to re-run.
+	CompletedStages []string `json:"completed_stages,omitempty"`
 
 	RuntimeMode string    `json:"runtime_mode"` // local | ephemeral | persistent | shared
 	WorkerRef   WorkerRef `json:"worker_ref"`
@@ -46,9 +54,10 @@ type WorkerRef struct {
 	Pod       string `json:"pod,omitempty"`
 	Service   string `json:"service,omitempty"`
 	Ingress   string `json:"ingress,omitempty"`
-	URL       string `json:"url,omitempty"`      // opencode server URL
-	UIURL     string `json:"ui_url,omitempty"`   // user-facing URL
-	Password  string `json:"password,omitempty"` // OPENCODE_SERVER_PASSWORD (not logged)
+	URL       string `json:"url,omitempty"`       // opencode server URL
+	AdminURL  string `json:"admin_url,omitempty"` // cmd/runner admin HTTP (git ops, session setup)
+	UIURL     string `json:"ui_url,omitempty"`    // user-facing URL
+	Password  string `json:"password,omitempty"`  // OPENCODE_SERVER_PASSWORD (not logged)
 }
 
 type RepoState struct {

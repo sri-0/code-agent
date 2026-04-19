@@ -80,22 +80,26 @@ func NewEngine(cfg *config.Config, logger zerolog.Logger, store tasks.Store) *En
 	}
 }
 
-// tryAcquire marks a task as running an action; returns false if one is
-// already in flight.
-func (e *Engine) tryAcquire(taskID string) bool {
+// tryAcquire marks a (task, stage) pair as running; returns false if the
+// same pair is already in flight. Keyed on task+stage (not just task) so
+// legitimate cascades — implement succeeding and calling open_mr within
+// the same call stack — don't self-deadlock.
+func (e *Engine) tryAcquire(taskID, stage string) bool {
+	key := taskID + "/" + stage
 	e.flightMu.Lock()
 	defer e.flightMu.Unlock()
-	if _, busy := e.inFlight[taskID]; busy {
+	if _, busy := e.inFlight[key]; busy {
 		return false
 	}
-	e.inFlight[taskID] = struct{}{}
+	e.inFlight[key] = struct{}{}
 	return true
 }
 
-func (e *Engine) release(taskID string) {
+func (e *Engine) release(taskID, stage string) {
+	key := taskID + "/" + stage
 	e.flightMu.Lock()
 	defer e.flightMu.Unlock()
-	delete(e.inFlight, taskID)
+	delete(e.inFlight, key)
 }
 
 // Register an action runner under a name (matches Stage.Action).
@@ -161,6 +165,17 @@ func (e *Engine) HandleEvent(ctx context.Context, evt providers.Event, board con
 	// the dispatcher cache).
 	if t.Stage == stg.Name && time.Since(t.LastSync) < 5*time.Second {
 		return nil
+	}
+	// Skip if this stage was already run to completion. Covers every kind
+	// of re-entry: terminal-stage self-trigger (description mutation
+	// bumps updated_at), non-terminal stage re-firing because a new
+	// event arrived at the same provider_status after we cascaded past.
+	// Each stage runs at most once per task.
+	for _, done := range t.CompletedStages {
+		if done == stg.Name {
+			e.logger.Debug().Str("task", t.ID).Str("stage", stg.Name).Msg("stage already completed; skipping re-entry")
+			return nil
+		}
 	}
 
 	e.logger.Info().Str("task", t.ID).Str("ext_id", t.ExternalID).Str("stage", stg.Name).Str("action", stg.Action).Msg("entering stage")
@@ -231,11 +246,11 @@ func (e *Engine) runAction(ctx context.Context, t *tasks.Task, b config.Board, s
 	// Prevent concurrent runs of the same task: a re-entered poll event
 	// while an action is already running would start a parallel (and
 	// destructive — sync wipes files) session.
-	if !e.tryAcquire(t.ID) {
+	if !e.tryAcquire(t.ID, stg.Name) {
 		e.logger.Debug().Str("task", t.ID).Str("stage", stg.Name).Msg("action already in flight; skipping re-entry")
 		return nil
 	}
-	defer e.release(t.ID)
+	defer e.release(t.ID, stg.Name)
 
 	timeout := stg.Timeout
 	if timeout == 0 {
@@ -273,6 +288,9 @@ func (e *Engine) runAction(ctx context.Context, t *tasks.Task, b config.Board, s
 	if res.Comment != "" {
 		_ = prov.Comment(ctx, t.ExternalID, providers.Comment{Body: res.Comment})
 	}
+	// Record the completion — terminal or not. Every stage runs at most
+	// once per task.
+	t.CompletedStages = append(t.CompletedStages, stg.Name)
 	t.UpdatedAt = time.Now()
 	if err := e.store.Update(ctx, t); err != nil {
 		return fmt.Errorf("save after action: %w", err)
@@ -343,6 +361,9 @@ func (e *Engine) advance(ctx context.Context, t *tasks.Task, b config.Board, stg
 	// fresh session. Each stage has its own system prompt; we don't want
 	// the plan-stage conversation leaking into the implement-stage turn.
 	t.SessionID = ""
+	// Don't clear CompletedStages — we keep the full history so any
+	// re-entry of a stage already run is skipped, even after we've
+	// advanced past it.
 	if err := e.store.Update(ctx, t); err != nil {
 		return err
 	}

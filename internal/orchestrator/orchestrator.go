@@ -56,9 +56,15 @@ func New(cfg *config.Config, logger zerolog.Logger, taskStore tasks.Store, tx tr
 	// Build runtimes (each name in runtime.yaml -> instance).
 	if cfg.Runtimes != nil {
 		for name, rcfg := range cfg.Runtimes.Runtimes {
+			var git config.GitIdentity
+			if cfg.Runtimes != nil {
+				git = cfg.Runtimes.Git
+			}
 			rt, err := runtime.Build(name, rcfg, runtime.Deps{
 				Logger:     o.logger,
 				Transcript: tx,
+				OpenCode:   cfg.OpenCode,
+				Git:        git,
 			})
 			if err != nil {
 				o.logger.Error().Err(err).Str("runtime", name).Msg("failed to build runtime")

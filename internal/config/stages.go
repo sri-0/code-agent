@@ -20,9 +20,12 @@ type Stage struct {
 	SystemPrompt   string        `yaml:"system_prompt,omitempty"`
 	// Opencode model selection for run_agent. Both optional: if empty,
 	// opencode's default provider/model is used.
-	Provider   string        `yaml:"provider,omitempty"` // e.g. "openrouter", "anthropic"
-	Model      string        `yaml:"model,omitempty"`    // e.g. "anthropic/claude-opus-4.7"
-	Mode       string        `yaml:"mode,omitempty"`     // opencode agent mode, e.g. "build"
+	Provider string `yaml:"provider,omitempty"` // e.g. "openrouter", "anthropic"
+	Model    string `yaml:"model,omitempty"`    // e.g. "anthropic/claude-opus-4.7"
+	// Agent is the opencode agent to invoke for this stage — e.g. "plan"
+	// or "build". Maps to opencode's /session/{id}/prompt_async body
+	// field `agent`. See https://opencode.ai/docs/server/#messages.
+	Agent string `yaml:"agent,omitempty"`
 	Next       string        `yaml:"next,omitempty"`     // for action=noop
 	SuccessNext string       `yaml:"success_next,omitempty"`
 	FailureNext string       `yaml:"failure_next,omitempty"`
@@ -33,6 +36,11 @@ type Stage struct {
 	// Used to gate the plan -> implement transition so a human can approve
 	// the plan first.
 	HumanReview bool          `yaml:"human_review,omitempty"`
+	// WritesPlan, when true, causes run_agent to write the stage's final
+	// assistant message (verbatim) to the ticket description after the
+	// stage completes. Used on the plan stage so the ticket description
+	// becomes the source of truth for subsequent stages.
+	WritesPlan bool           `yaml:"writes_plan,omitempty"`
 	Timeout     time.Duration `yaml:"timeout,omitempty"`
 	MaxRetries  int           `yaml:"max_retries,omitempty"`
 	MRTemplate  string        `yaml:"mr_template,omitempty"` // for action=open_mr

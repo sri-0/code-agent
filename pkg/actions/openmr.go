@@ -2,17 +2,28 @@
 // neatly in pkg/runtime (which is for runtime-adjacent actions like
 // run_agent). Each action is standalone and registered in the orchestrator.
 //
-// OpenMRRunner is the "commit → push → open PR" action. It's orchestrator-
-// driven: the agent leaves modified/created files on disk, this action
-// detects them, generates a commit message and PR body via an LLM call
-// (pkg/llm), commits + pushes to ai/<ticket-id> per repo, and opens a PR
-// against the configured base branch.
+// OpenMRRunner is the "commit → push → open PR" action. It has two code
+// paths:
+//
+//  1. Pod-based runtimes (ephemeral/persistent/shared): the task's
+//     WorkerRef.AdminURL is non-empty. The orchestrator calls
+//     cmd/runner's admin HTTP over that URL to get the diff, craft a
+//     commit message + PR body via LLM, then POST /commit-push to have
+//     the runner do the actual git. Orchestrator never touches the
+//     pod's filesystem.
+//
+//  2. Local runtime: AdminURL is empty, CODE_AGENT_WORKSPACE env points
+//     at the host dir containing the repos. Orchestrator shells git
+//     directly against that dir.
 package actions
 
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,12 +40,10 @@ import (
 	"code-agent/pkg/vcs"
 )
 
-// OpenMRRunner commits + pushes + opens PRs for a task. VCS clients and the
-// LLM client are cached per-runner.
 type OpenMRRunner struct {
 	mu      sync.Mutex
-	clients map[string]vcs.Client // repo_name -> client
-	llm     *llm.Client           // nil if no API key configured
+	clients map[string]vcs.Client
+	llm     *llm.Client
 	llmErr  error
 }
 
@@ -49,21 +58,29 @@ func NewOpenMRRunner() *OpenMRRunner {
 	return r
 }
 
-// Run satisfies stages.ActionRunner.
 func (r *OpenMRRunner) Run(ctx context.Context, in stages.ActionInput) (stages.ActionResult, error) {
 	logger := in.Logger.With().Str("action", "open_mr").Logger()
 
 	if len(in.Task.Repos) == 0 {
 		return stages.ActionResult{Outcome: "success", Comment: "open_mr: no repos configured"}, nil
 	}
-
-	workspace := os.Getenv("CODE_AGENT_WORKSPACE")
-	if workspace == "" {
-		return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("CODE_AGENT_WORKSPACE env not set — cannot locate repos on disk")
-	}
-
 	if r.llm == nil {
 		logger.Warn().Err(r.llmErr).Msg("LLM client unavailable; falling back to template commit/pr text")
+	}
+
+	// Decide mode based on whether the worker exposes an admin HTTP.
+	adminURL := in.Task.WorkerRef.AdminURL
+	var driver gitDriver
+	if adminURL != "" {
+		driver = &podDriver{adminURL: adminURL, logger: logger}
+		logger.Info().Str("admin_url", adminURL).Msg("using pod admin HTTP for git ops")
+	} else {
+		workspace := os.Getenv("CODE_AGENT_WORKSPACE")
+		if workspace == "" {
+			return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("no pod AdminURL and CODE_AGENT_WORKSPACE unset — cannot do git")
+		}
+		driver = &hostDriver{workspace: workspace, logger: logger}
+		logger.Info().Str("workspace", workspace).Msg("using host filesystem for git ops")
 	}
 
 	var opened []vcs.MergeRequest
@@ -71,54 +88,27 @@ func (r *OpenMRRunner) Run(ctx context.Context, in stages.ActionInput) (stages.A
 	var summary bytes.Buffer
 
 	for _, rp := range in.Task.Repos {
-		repoDir := filepath.Join(workspace, rp.Name)
-		if _, err := os.Stat(filepath.Join(repoDir, ".git")); err != nil {
-			logger.Warn().Str("repo", rp.Name).Str("dir", repoDir).Msg("not a git checkout; skipping")
-			continue
-		}
 		if alreadyOpen(in.Task.MergeRequests, rp.Name) {
 			logger.Info().Str("repo", rp.Name).Msg("MR already exists; skipping")
 			continue
 		}
-
-		// any local changes (tracked + untracked)?
-		statCtx, cancelStat := context.WithTimeout(ctx, 30*time.Second)
-		dirty, err := hasChanges(statCtx, repoDir)
-		cancelStat()
-		if err != nil {
-			return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("git status %s: %w", rp.Name, err)
-		}
-		if !dirty {
-			logger.Info().Str("repo", rp.Name).Msg("no local changes; skipping")
-			continue
-		}
-
 		branch := rp.Branch
 		if branch == "" {
 			branch = "ai/" + in.Task.ExternalID
 		}
 
-		// stage everything first so `git diff --cached` covers untracked too
-		if err := runGit(ctx, repoDir, "checkout", "-B", branch, rp.BaseBranch); err != nil {
-			return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("checkout %s %s: %w", rp.Name, branch, err)
-		}
-		// bring files forward onto the new branch
-		// (checkout -B already keeps working tree; nothing to do)
-		if err := runGit(ctx, repoDir, "add", "-A"); err != nil {
-			return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("git add %s: %w", rp.Name, err)
-		}
-		diffCtx, cancelDiff := context.WithTimeout(ctx, 60*time.Second)
-		diff, err := gitDiffCached(diffCtx, repoDir)
-		cancelDiff()
+		statCtx, cancelStat := context.WithTimeout(ctx, 30*time.Second)
+		dirty, diff, err := driver.getStatusAndDiff(statCtx, rp.Name)
+		cancelStat()
 		if err != nil {
-			return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("git diff --cached %s: %w", rp.Name, err)
+			return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("status %s: %w", rp.Name, err)
 		}
-		if strings.TrimSpace(diff) == "" {
-			logger.Info().Str("repo", rp.Name).Msg("diff empty after staging; skipping")
+		if !dirty || strings.TrimSpace(diff) == "" {
+			logger.Info().Str("repo", rp.Name).Msg("no local changes; skipping")
 			continue
 		}
 
-		// LLM-generated commit + PR text
+		// LLM commit/PR summary
 		var change llm.ChangeSummary
 		if r.llm != nil {
 			llmCtx, cancelLLM := context.WithTimeout(ctx, 90*time.Second)
@@ -136,20 +126,16 @@ func (r *OpenMRRunner) Run(ctx context.Context, in stages.ActionInput) (stages.A
 			}
 		}
 
-		// commit
-		if err := runGit(ctx, repoDir, "commit", "-m", change.CommitMessage); err != nil {
-			return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("git commit %s: %w", rp.Name, err)
-		}
-		// push
-		pushCtx, cancelPush := context.WithTimeout(ctx, 120*time.Second)
-		if err := runGitCtx(pushCtx, repoDir, "push", "-u", "origin", branch); err != nil {
+		// commit + push via the driver
+		pushCtx, cancelPush := context.WithTimeout(ctx, 180*time.Second)
+		if err := driver.commitAndPush(pushCtx, rp.Name, branch, rp.BaseBranch, change.CommitMessage); err != nil {
 			cancelPush()
-			return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("git push %s: %w", rp.Name, err)
+			return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("commit/push %s: %w", rp.Name, err)
 		}
 		cancelPush()
 		logger.Info().Str("repo", rp.Name).Str("branch", branch).Msg("branch pushed")
 
-		// open PR
+		// open PR via VCS API
 		boardRepo, ok := findBoardRepo(in.Board, rp.Name)
 		if !ok {
 			logger.Warn().Str("repo", rp.Name).Msg("repo not in board config; skipping PR open")
@@ -237,41 +223,136 @@ func (r *OpenMRRunner) crosslink(ctx context.Context, logger zerolog.Logger, mrs
 	}
 }
 
-// ---- git helpers ----
+// ---- gitDriver: two implementations (pod via HTTP, host via shell) ----
 
-func hasChanges(ctx context.Context, dir string) (bool, error) {
-	cmd := exec.CommandContext(ctx, "git", "-C", dir, "status", "--porcelain")
-	out, err := cmd.Output()
+type gitDriver interface {
+	getStatusAndDiff(ctx context.Context, repoName string) (dirty bool, diff string, err error)
+	commitAndPush(ctx context.Context, repoName, branch, baseBranch, commitMessage string) error
+}
+
+// podDriver talks to cmd/runner's admin HTTP.
+type podDriver struct {
+	adminURL string
+	logger   zerolog.Logger
+}
+
+func (p *podDriver) getStatusAndDiff(ctx context.Context, repoName string) (bool, string, error) {
+	// /repos/{name}/status -> {dirty, changes[]}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, p.adminURL+"/repos/"+repoName+"/status", nil)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return false, err
+		return false, "", fmt.Errorf("admin status: %w", err)
 	}
-	return strings.TrimSpace(string(out)) != "", nil
-}
-
-func gitDiffCached(ctx context.Context, dir string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", "-C", dir, "diff", "--cached", "--no-color")
-	out, err := cmd.Output()
-	if err != nil {
-		return "", err
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return false, "", fmt.Errorf("admin status http %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	return string(out), nil
-}
-
-func runGit(ctx context.Context, dir string, args ...string) error {
-	return runGitCtx(ctx, dir, args...)
-}
-
-func runGitCtx(ctx context.Context, dir string, args ...string) error {
-	full := append([]string{"-C", dir}, args...)
-	cmd := exec.CommandContext(ctx, "git", full...)
-	out, err := cmd.CombinedOutput()
+	var s struct {
+		Dirty   bool     `json:"dirty"`
+		Changes []string `json:"changes"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
+		return false, "", fmt.Errorf("admin status decode: %w", err)
+	}
+	if !s.Dirty {
+		return false, "", nil
+	}
+	// Fetch diff
+	req2, _ := http.NewRequestWithContext(ctx, http.MethodGet, p.adminURL+"/repos/"+repoName+"/diff", nil)
+	r2, err := http.DefaultClient.Do(req2)
 	if err != nil {
-		return fmt.Errorf("git %s: %w (%s)", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		return true, "", fmt.Errorf("admin diff: %w", err)
+	}
+	defer r2.Body.Close()
+	if r2.StatusCode >= 300 {
+		body, _ := io.ReadAll(r2.Body)
+		return true, "", fmt.Errorf("admin diff http %d: %s", r2.StatusCode, strings.TrimSpace(string(body)))
+	}
+	body, err := io.ReadAll(r2.Body)
+	if err != nil {
+		return true, "", err
+	}
+	return true, string(body), nil
+}
+
+func (p *podDriver) commitAndPush(ctx context.Context, repoName, branch, baseBranch, msg string) error {
+	body, _ := json.Marshal(map[string]string{
+		"branch":         branch,
+		"base_branch":    baseBranch,
+		"commit_message": msg,
+	})
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, p.adminURL+"/repos/"+repoName+"/commit-push", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("admin commit-push: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("admin commit-push http %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 	return nil
 }
 
-// ---- helpers retained from previous impl ----
+// hostDriver shells git directly on the orchestrator's filesystem.
+type hostDriver struct {
+	workspace string
+	logger    zerolog.Logger
+}
+
+func (h *hostDriver) repoDir(name string) string { return filepath.Join(h.workspace, name) }
+
+func (h *hostDriver) getStatusAndDiff(ctx context.Context, repoName string) (bool, string, error) {
+	dir := h.repoDir(repoName)
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err != nil {
+		return false, "", nil
+	}
+	out, err := exec.CommandContext(ctx, "git", "-C", dir, "status", "--porcelain").Output()
+	if err != nil {
+		return false, "", err
+	}
+	if strings.TrimSpace(string(out)) == "" {
+		return false, "", nil
+	}
+	if err := shellGit(ctx, dir, "add", "-A"); err != nil {
+		return true, "", err
+	}
+	diff, err := exec.CommandContext(ctx, "git", "-C", dir, "diff", "--cached", "--no-color").Output()
+	if err != nil {
+		return true, "", err
+	}
+	return true, string(diff), nil
+}
+
+func (h *hostDriver) commitAndPush(ctx context.Context, repoName, branch, baseBranch, msg string) error {
+	dir := h.repoDir(repoName)
+	steps := [][]string{
+		{"checkout", "-B", branch, baseBranch},
+		{"add", "-A"},
+		{"commit", "-m", msg},
+		{"push", "-u", "origin", branch},
+	}
+	for _, args := range steps {
+		if err := shellGit(ctx, dir, args...); err != nil {
+			return fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+		}
+	}
+	return nil
+}
+
+func shellGit(ctx context.Context, dir string, args ...string) error {
+	full := append([]string{"-C", dir}, args...)
+	cmd := exec.CommandContext(ctx, "git", full...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// ---- helpers ----
 
 func findBoardRepo(b config.Board, name string) (config.BoardRepo, bool) {
 	for _, r := range b.Repos {

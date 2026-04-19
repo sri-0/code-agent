@@ -1,4 +1,4 @@
-.PHONY: server dev-local dev-k8s cli build test tidy docker docker-worker fmt vet minikube-up minikube-down
+.PHONY: server dev-local dev-k8s cli build test tidy docker docker-worker fmt vet minikube-up minikube-down minikube-bootstrap
 
 # Production server entry
 server:
@@ -44,9 +44,19 @@ docker-worker:
 	docker build -f docker/opencode/Dockerfile -t code-agent-worker:dev .
 
 # --- Minikube helpers ---
+# Start minikube only — no cluster resources created.
 minikube-up:
 	minikube start --driver=docker --cpus=4 --memory=6g
-	kubectl apply -f deploy/k8s/rbac.yaml
 
 minikube-down:
 	minikube stop
+
+# One-time cluster bootstrap: namespace + RBAC + worker image. Run once
+# after minikube-up (or whenever the worker image changes).
+minikube-bootstrap: docker-worker
+	kubectl apply -f deploy/k8s/rbac.yaml
+	minikube image load code-agent-worker:dev
+	@echo ""
+	@echo "--- minikube bootstrap complete ---"
+	@kubectl -n code-agent get sa,role,rolebinding
+	@minikube ssh -- docker images code-agent-worker:dev 2>/dev/null | tail -2

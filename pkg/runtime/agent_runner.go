@@ -108,7 +108,7 @@ func (r *AgentRunner) Run(ctx context.Context, in stages.ActionInput) (stages.Ac
 	err = client.PostMessage(ctx, sessionID, opencode.PostMessageRequest{
 		ProviderID: in.Stage.Provider,
 		ModelID:    in.Stage.Model,
-		Mode:       in.Stage.Mode,
+		Agent:      in.Stage.Agent,
 		System:     in.Stage.SystemPrompt,
 		Parts:      []opencode.MessagePart{{Type: "text", Text: userMsg}},
 	})
@@ -147,8 +147,8 @@ func (r *AgentRunner) Run(ctx context.Context, in stages.ActionInput) (stages.Ac
 			},
 		}, nil
 	}
-	if plan, ok := parsePlan(lastText); ok {
-		newDesc := formatPlanDescription(in.Task, plan)
+	if in.Stage.WritesPlan && strings.TrimSpace(lastText) != "" {
+		newDesc := formatPlanDescription(in.Task, lastText)
 		in.Logger.Info().Int("bytes", len(newDesc)).Msg("updating ticket description with plan")
 		descCtx, cancelDesc := context.WithTimeout(context.Background(), 15*time.Second)
 		if err := in.Provider.UpdateDescription(descCtx, in.Task.ExternalID, newDesc); err != nil {
@@ -164,28 +164,6 @@ func (r *AgentRunner) Run(ctx context.Context, in stages.ActionInput) (stages.Ac
 			t.RuntimeMode = rt.Mode()
 		},
 	}, nil
-}
-
-// parsePlan extracts the markdown between PLAN_START / PLAN_END sentinel
-// lines. Returns the inner text and true on success. Both sentinels must
-// appear on their own lines.
-func parsePlan(text string) (string, bool) {
-	startIdx := strings.Index(text, "PLAN_START")
-	if startIdx < 0 {
-		return "", false
-	}
-	// advance past the PLAN_START line
-	nl := strings.IndexByte(text[startIdx:], '\n')
-	if nl < 0 {
-		return "", false
-	}
-	bodyStart := startIdx + nl + 1
-	rest := text[bodyStart:]
-	endIdx := strings.Index(rest, "PLAN_END")
-	if endIdx < 0 {
-		return "", false
-	}
-	return strings.TrimSpace(rest[:endIdx]), true
 }
 
 // formatPlanDescription builds the new ticket description: an "Agent plan"

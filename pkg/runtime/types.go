@@ -41,6 +41,17 @@ type Runtime interface {
 type Deps struct {
 	Logger     zerolog.Logger
 	Transcript transcript.Store
+	// OpenCode is the opencode.json content to inject into worker pods
+	// (ephemeral/persistent/shared). Local runtime ignores it — the host
+	// opencode has its own config file. Nil means cmd/runner will fall
+	// back to its minimal default. API keys live inline inside this
+	// config (e.g. provider.openrouter.options.apiKey), so no separate
+	// env forwarding is needed.
+	OpenCode config.OpenCodeConfig
+	// Git is the identity used by cmd/runner when it makes commits on
+	// behalf of the agent. Applied via `git config --global` at pod
+	// startup. Empty fields fall back to runner-side defaults.
+	Git config.GitIdentity
 }
 
 // Factory builds a Runtime instance from a named runtime config entry.

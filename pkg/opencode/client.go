@@ -27,19 +27,27 @@ type Options struct {
 }
 
 func New(opts Options, logger zerolog.Logger) *Client {
-	// Timeout=0 means "no hard cap" on the underlying http.Client — ctx
-	// is the only bound. Sync PostMessage uses a 45m action ctx; short
-	// calls (Health, CreateSession, etc.) wrap their own context with
-	// shorter deadlines at the call site.
-	// Callers that want a cap can pass opts.Timeout explicitly.
+	// PostMessage is synchronous — it blocks for the entire model turn
+	// (can be many minutes). pkg/httpclient's default timeout is 30s,
+	// which would cut it off. Set a generous 2-hour cap; the per-call
+	// context (stage.Timeout, ~45m) bounds it tighter in practice.
+	// Short utility calls (Health, CreateSession) wrap their own
+	// shorter context at the call site.
+	if opts.Timeout == 0 {
+		opts.Timeout = 2 * time.Hour
+	}
 	headers := map[string]string{}
 	if opts.Password != "" {
 		headers["Authorization"] = "Bearer " + opts.Password
 	}
 	hc := httpclient.New(httpclient.Options{
-		BaseURL:        strings.TrimRight(opts.BaseURL, "/"),
-		Timeout:        opts.Timeout,
-		MaxRetries:     3,
+		BaseURL: strings.TrimRight(opts.BaseURL, "/"),
+		Timeout: opts.Timeout,
+		// No retries — PostMessage is not idempotent. A transport-level
+		// retry would submit the same user message twice (or more), and
+		// opencode queues each one separately. Leave retry decisions to
+		// the caller (stage engine re-entry + action-level ctx).
+		MaxRetries:     0,
 		DefaultHeaders: headers,
 	}, logger.With().Str("component", "opencode").Logger())
 	return &Client{

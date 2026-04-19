@@ -38,7 +38,7 @@ type Config struct {
 	Boards   *BoardsConfig
 	Stages   *StagesConfig
 	Runtimes *RuntimesConfig
-	OpenCode *OpenCodeConfig
+	OpenCode OpenCodeConfig
 }
 
 // Load reads env vars; call LoadYAML afterwards to populate the YAML fields.

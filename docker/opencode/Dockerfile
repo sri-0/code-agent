@@ -13,9 +13,14 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/runner ./cmd/runner
 
-# --- runtime: node + git + opencode + our runner ---
-FROM node:22-alpine
-RUN apk add --no-cache git openssh-client ca-certificates bash curl
+# --- runtime: node (debian/glibc) + git + opencode + our runner ---
+# Alpine's musl libc breaks opencode's postinstall native binary — opencode
+# downloads a glibc-built shim that spawnSyncs a native binary. Stay on
+# debian-slim for compatibility.
+FROM node:22-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git openssh-client ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
 # Pin opencode to a known version; override with --build-arg OPENCODE_VERSION=...
 ARG OPENCODE_VERSION=latest
 RUN npm install -g opencode-ai@${OPENCODE_VERSION} \
@@ -26,7 +31,8 @@ COPY --from=build /out/runner /usr/local/bin/runner
 WORKDIR /workspace
 EXPOSE 4096
 # Run as a non-root user with a real HOME so opencode can persist auth files.
-RUN adduser -D -u 1000 -h /home/worker worker \
+# node:22-slim already ships a 'node' user at UID 1000; pick 1001.
+RUN useradd -m -u 1001 -d /home/worker -s /bin/bash worker \
     && mkdir -p /workspace \
     && chown -R worker:worker /workspace /home/worker
 USER worker

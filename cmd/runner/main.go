@@ -58,6 +58,19 @@ func main() {
 		fatalf("mkdir %s: %v", workspaceDir, err)
 	}
 
+	// Give the pod's git a default identity so commits succeed. This
+	// writes /home/worker/.gitconfig (no --system needed). Override via
+	// CODE_AGENT_GIT_USER_NAME/EMAIL env if you want something other
+	// than the defaults.
+	gitName := envDefault("CODE_AGENT_GIT_USER_NAME", "code-agent")
+	gitEmail := envDefault("CODE_AGENT_GIT_USER_EMAIL", "code-agent@local")
+	if err := exec.Command("git", "config", "--global", "user.name", gitName).Run(); err != nil {
+		logf("warn: git config user.name: %v", err)
+	}
+	if err := exec.Command("git", "config", "--global", "user.email", gitEmail).Run(); err != nil {
+		logf("warn: git config user.email: %v", err)
+	}
+
 	eager := mode != "shared"
 	repos, err := parseRepos(os.Getenv("CODE_AGENT_REPOS"))
 	if err != nil {
@@ -141,6 +154,7 @@ func startAdminHTTP(port string) *http.Server {
 		_, _ = io.WriteString(w, "ok")
 	})
 	mux.HandleFunc("/sessions/", handleSessions)
+	mux.HandleFunc("/repos/", handleRepos)
 
 	srv := &http.Server{Addr: ":" + port, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	ln, err := net.Listen("tcp", srv.Addr)
@@ -221,6 +235,142 @@ func handleDelete(w http.ResponseWriter, _ *http.Request, sid string) {
 		return
 	}
 	w.WriteHeader(204)
+}
+
+// ---- repo git operations ----
+//
+// GET  /repos/{name}/status        -> {dirty: bool, changes: ["M path", ...]}
+// GET  /repos/{name}/diff          -> raw git diff after `git add -A`
+// POST /repos/{name}/commit-push   -> body: {branch, commit_message}; runs
+//                                     checkout -B branch, add -A, commit,
+//                                     push -u origin branch
+//
+// All paths operate on /workspace/<name>. 404 if the dir isn't a git
+// checkout. Output is intentionally minimal — the orchestrator decides
+// branch names and commit messages.
+
+var repoNameRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
+
+func handleRepos(w http.ResponseWriter, r *http.Request) {
+	p := strings.TrimPrefix(r.URL.Path, "/repos/")
+	parts := strings.SplitN(p, "/", 2)
+	if len(parts) == 0 || parts[0] == "" {
+		http.Error(w, "repo name required", 400)
+		return
+	}
+	name := parts[0]
+	if !repoNameRe.MatchString(name) {
+		http.Error(w, "invalid repo name", 400)
+		return
+	}
+	sub := ""
+	if len(parts) == 2 {
+		sub = parts[1]
+	}
+
+	dir := filepath.Join(workspaceDir, name)
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err != nil {
+		http.Error(w, "repo not found", 404)
+		return
+	}
+
+	switch {
+	case r.Method == http.MethodGet && sub == "status":
+		handleRepoStatus(w, r, dir)
+	case r.Method == http.MethodGet && sub == "diff":
+		handleRepoDiff(w, r, dir)
+	case r.Method == http.MethodPost && sub == "commit-push":
+		handleRepoCommitPush(w, r, dir)
+	default:
+		http.Error(w, "not found", 404)
+	}
+}
+
+func handleRepoStatus(w http.ResponseWriter, _ *http.Request, dir string) {
+	out, err := runGitOut(dir, "status", "--porcelain")
+	if err != nil {
+		http.Error(w, "git status: "+err.Error(), 500)
+		return
+	}
+	changes := []string{}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			changes = append(changes, line)
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"dirty":   len(changes) > 0,
+		"changes": changes,
+	})
+}
+
+func handleRepoDiff(w http.ResponseWriter, _ *http.Request, dir string) {
+	// Stage untracked + modified so `git diff --cached` shows everything.
+	if err := runGit(dir, "add", "-A"); err != nil {
+		http.Error(w, "git add: "+err.Error(), 500)
+		return
+	}
+	out, err := runGitOut(dir, "diff", "--cached", "--no-color")
+	if err != nil {
+		http.Error(w, "git diff: "+err.Error(), 500)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write(out)
+}
+
+type commitPushReq struct {
+	Branch        string `json:"branch"`
+	CommitMessage string `json:"commit_message"`
+	BaseBranch    string `json:"base_branch"` // optional; if set, `git checkout -B branch base_branch`
+}
+
+func handleRepoCommitPush(w http.ResponseWriter, r *http.Request, dir string) {
+	var req commitPushReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad body: "+err.Error(), 400)
+		return
+	}
+	if req.Branch == "" || req.CommitMessage == "" {
+		http.Error(w, "branch and commit_message required", 400)
+		return
+	}
+	steps := [][]string{}
+	if req.BaseBranch != "" {
+		steps = append(steps, []string{"checkout", "-B", req.Branch, req.BaseBranch})
+	} else {
+		steps = append(steps, []string{"checkout", "-B", req.Branch})
+	}
+	steps = append(steps,
+		[]string{"add", "-A"},
+		[]string{"commit", "-m", req.CommitMessage},
+		[]string{"push", "-u", "origin", req.Branch},
+	)
+	for _, args := range steps {
+		if err := runGit(dir, args...); err != nil {
+			http.Error(w, "git "+strings.Join(args, " ")+": "+err.Error(), 500)
+			return
+		}
+	}
+	w.WriteHeader(204)
+}
+
+func runGit(dir string, args ...string) error {
+	full := append([]string{"-C", dir}, args...)
+	cmd := exec.Command("git", full...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func runGitOut(dir string, args ...string) ([]byte, error) {
+	full := append([]string{"-C", dir}, args...)
+	cmd := exec.Command("git", full...)
+	return cmd.Output()
 }
 
 // ---- setup helpers ----

@@ -1,3 +1,12 @@
+# Git identity used by worker pods when the orchestrator asks cmd/runner
+# to make commits on behalf of the agent. Shipped to the pod as env vars
+# CODE_AGENT_GIT_USER_NAME / _EMAIL; the runner applies them via
+# `git config --global` at startup. Override per-deployment by editing
+# your config/local/runtime.yaml.
+git:
+  user_name: code-agent
+  user_email: code-agent@example.com
+
 runtimes:
   default:
     mode: ephemeral

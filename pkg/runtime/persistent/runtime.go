@@ -13,6 +13,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"os"
+	"strings"
 	"sync"
 	"text/template"
 	"time"
@@ -34,9 +36,14 @@ type Runtime struct {
 	tx     transcript.Store
 	k      *k8s.Client
 
+	openCode config.OpenCodeConfig
+	git      config.GitIdentity
+
 	mu       sync.Mutex
 	clients  map[string]*opencode.Client
 	sessions map[string]string
+	forwards map[string]*k8s.PortForward // task id -> tunnel (out-of-cluster only)
+	refs     map[string]*tasks.WorkerRef // task id -> cached full ref (includes AdminURL, port-forward URLs)
 	password string
 }
 
@@ -46,9 +53,13 @@ func (r *Runtime) EnsureWorker(ctx context.Context, t *tasks.Task, b config.Boar
 	depName := depNameFor(t)
 	r.mu.Lock()
 	if c, ok := r.clients[t.ID]; ok {
-		ref := r.refFor(t, b)
+		ref := r.refs[t.ID]
 		r.mu.Unlock()
-		return c, ref, nil
+		if ref != nil {
+			return c, ref, nil
+		}
+		// fallback shouldn't normally happen; rebuild without port-forward info
+		return c, r.refFor(t, b), nil
 	}
 	r.mu.Unlock()
 
@@ -75,6 +86,24 @@ func (r *Runtime) EnsureWorker(ctx context.Context, t *tasks.Task, b config.Boar
 
 	if !exists {
 		env := baseEnv(r.password, t, b, "persistent")
+		// Git identity for commits the runner makes on behalf of agents.
+		if r.git.UserName != "" {
+			env["CODE_AGENT_GIT_USER_NAME"] = r.git.UserName
+		}
+		if r.git.UserEmail != "" {
+			env["CODE_AGENT_GIT_USER_EMAIL"] = r.git.UserEmail
+		}
+		// Inject opencode.json (as compact JSON in env) if the orchestrator
+		// was given one. cmd/runner writes this to /workspace/opencode.json
+		// before launching opencode serve. The config includes provider
+		// API keys inline (matches the user's local opencode.json shape).
+		if r.openCode != nil {
+			if j, err := r.openCode.JSON(); err != nil {
+				return nil, nil, fmt.Errorf("marshal opencode config: %w", err)
+			} else if j != nil {
+				env["CODE_AGENT_OPENCODE_CONFIG"] = string(j)
+			}
+		}
 		spec := k8s.DeploymentSpec{
 			Name:      depName,
 			Namespace: r.cfg.Namespace,
@@ -108,16 +137,49 @@ func (r *Runtime) EnsureWorker(ctx context.Context, t *tasks.Task, b config.Boar
 		return nil, nil, fmt.Errorf("wait ready: %w", err)
 	}
 
-	url := fmt.Sprintf("http://%s.%s.svc.cluster.local:4096", depName, r.cfg.Namespace)
-	client := opencode.New(opencode.Options{BaseURL: url, Password: r.password}, r.logger)
+	// URL selection:
+	//   - In-cluster: use the Service DNS (fastest, always routable).
+	//   - Out-of-cluster (dev laptop): SPDY port-forward to the pod via
+	//     the apiserver. We forward both 4096 (opencode) and 4100 (admin)
+	//     so the orchestrator can drive git ops via cmd/runner admin HTTP.
+	var (
+		openURL  string
+		adminURL string
+		fwd      *k8s.PortForward
+	)
+	if r.k.InCluster {
+		openURL = fmt.Sprintf("http://%s.%s.svc.cluster.local:4096", depName, r.cfg.Namespace)
+		adminURL = fmt.Sprintf("http://%s.%s.svc.cluster.local:4100", depName, r.cfg.Namespace)
+	} else {
+		pf, err := r.k.ForwardPodPorts(ctx, r.cfg.Namespace, pod, []int{4096, 4100})
+		if err != nil {
+			return nil, nil, fmt.Errorf("port-forward: %w", err)
+		}
+		fwd = pf
+		openURL = fmt.Sprintf("http://localhost:%d", pf.LocalPorts[4096])
+		adminURL = fmt.Sprintf("http://localhost:%d", pf.LocalPorts[4100])
+		r.logger.Info().
+			Str("pod", pod).
+			Int("opencode_port", pf.LocalPorts[4096]).
+			Int("admin_port", pf.LocalPorts[4100]).
+			Msg("port-forward established")
+	}
+	client := opencode.New(opencode.Options{BaseURL: openURL, Password: r.password}, r.logger)
 	if err := client.WaitForReady(ctx, 60*time.Second); err != nil {
+		if fwd != nil {
+			fwd.Close()
+		}
 		return nil, nil, fmt.Errorf("opencode ready: %w", err)
 	}
 
 	r.mu.Lock()
 	r.clients[t.ID] = client
-	r.mu.Unlock()
-
+	if fwd != nil {
+		r.forwards[t.ID] = fwd
+	}
+	// Cache the ref too — subsequent EnsureWorker calls return the same
+	// URL/AdminURL so downstream actions (open_mr) reach the pod via the
+	// port-forward, not an unreachable svc.cluster.local DNS name.
 	ref := &tasks.WorkerRef{
 		Mode:      "persistent",
 		Namespace: r.cfg.Namespace,
@@ -125,11 +187,14 @@ func (r *Runtime) EnsureWorker(ctx context.Context, t *tasks.Task, b config.Boar
 		Name:      depName,
 		Pod:       pod,
 		Service:   depName,
-		URL:       url,
+		URL:       openURL,
+		AdminURL:  adminURL,
 		UIURL:     uiURL(host),
 		Password:  r.password,
 		Ingress:   ingressNameIfEnabled(host, depName),
 	}
+	r.refs[t.ID] = ref
+	r.mu.Unlock()
 	return client, ref, nil
 }
 
@@ -184,6 +249,11 @@ func (r *Runtime) Cleanup(ctx context.Context, t *tasks.Task) error {
 	r.mu.Lock()
 	delete(r.clients, t.ID)
 	delete(r.sessions, t.ID)
+	delete(r.refs, t.ID)
+	if fwd, ok := r.forwards[t.ID]; ok {
+		fwd.Close()
+		delete(r.forwards, t.ID)
+	}
 	r.mu.Unlock()
 	return r.k.DeleteDeployment(ctx, r.cfg.Namespace, dn)
 }
@@ -200,14 +270,37 @@ func depNameFor(t *tasks.Task) string {
 
 func baseEnv(password string, t *tasks.Task, b config.Board, mode string) map[string]string {
 	env := map[string]string{
-		"OPENCODE_SERVER_PASSWORD": password,
-		"CODE_AGENT_TASK_ID":       t.ID,
-		"CODE_AGENT_BOARD_ID":      b.ID,
-		"CODE_AGENT_EXTERNAL_ID":   t.ExternalID,
-		"CODE_AGENT_RUNTIME_MODE":  mode,
+		"CODE_AGENT_TASK_ID":      t.ID,
+		"CODE_AGENT_BOARD_ID":     b.ID,
+		"CODE_AGENT_EXTERNAL_ID":  t.ExternalID,
+		"CODE_AGENT_RUNTIME_MODE": mode,
+	}
+	// Password-protect only if a non-empty one was passed. For in-cluster
+	// use we leave it unset — /app must be reachable unauthenticated for
+	// the kubelet readiness probe to succeed. The pod's port is only
+	// reachable from inside the cluster or via the orchestrator's
+	// port-forward, so the exposure is bounded.
+	if password != "" {
+		env["OPENCODE_SERVER_PASSWORD"] = password
 	}
 	if len(t.Repos) > 0 {
 		env["CODE_AGENT_REPOS"] = reposCSV(t.Repos)
+	}
+	// Per-repo git auth: cmd/runner looks for CODE_AGENT_GIT_TOKEN_<NAME>
+	// (uppercase, dashes -> underscores) and injects the token as HTTP
+	// basic auth in the clone URL. The orchestrator reads the token's
+	// value from its own env (the one named in boards.yaml vcs.auth.env)
+	// and ships it into the pod.
+	for _, br := range b.Repos {
+		if br.VCS.Auth.Env == "" {
+			continue
+		}
+		tok := os.Getenv(br.VCS.Auth.Env)
+		if tok == "" {
+			continue
+		}
+		key := "CODE_AGENT_GIT_TOKEN_" + strings.ToUpper(strings.ReplaceAll(br.Name, "-", "_"))
+		env[key] = tok
 	}
 	return env
 }
@@ -274,9 +367,13 @@ func init() {
 			logger:   deps.Logger.With().Str("runtime", "persistent").Str("name", name).Logger(),
 			tx:       deps.Transcript,
 			k:        kc,
+			openCode: deps.OpenCode,
+			git:      deps.Git,
 			clients:  map[string]*opencode.Client{},
 			sessions: map[string]string{},
-			password: randPassword(),
+			forwards: map[string]*k8s.PortForward{},
+			refs:     map[string]*tasks.WorkerRef{},
+			password: "", // no opencode auth for in-cluster use; probe-friendly
 		}, nil
 	})
 }

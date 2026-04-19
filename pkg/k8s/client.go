@@ -15,9 +15,10 @@ import (
 
 // Client bundles the typed kubernetes client.
 type Client struct {
-	CS        *kubernetes.Clientset
-	Namespace string
-	InCluster bool
+	CS         *kubernetes.Clientset
+	Namespace  string
+	InCluster  bool
+	restConfig *rest.Config // exposed to pkg/k8s helpers (port-forward)
 }
 
 // New constructs a client. If KUBECONFIG or ~/.kube/config exists and
@@ -35,7 +36,7 @@ func New(namespace string) (*Client, error) {
 	if namespace == "" {
 		namespace = "default"
 	}
-	return &Client{CS: cs, Namespace: namespace, InCluster: inCluster}, nil
+	return &Client{CS: cs, Namespace: namespace, InCluster: inCluster, restConfig: cfg}, nil
 }
 
 func loadConfig() (*rest.Config, bool, error) {
