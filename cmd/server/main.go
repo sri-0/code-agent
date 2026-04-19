@@ -16,9 +16,10 @@ import (
 var version = "dev"
 
 func main() {
-	ctx := context.Background()
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+	defer rootCancel()
 
-	res, err := bootstrap.Init(ctx)
+	res, err := bootstrap.Init(rootCtx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "bootstrap: %v\n", err)
 		os.Exit(1)
@@ -26,9 +27,14 @@ func main() {
 	cfg := res.Cfg
 	logger := res.Logger
 
+	if res.Orch != nil {
+		go res.Orch.Start(rootCtx)
+	}
+
 	router := server.NewRouter(server.Deps{
 		Version: version,
 		Tasks:   res.Tasks,
+		Orch:    res.Orch,
 		Logger:  logger,
 	})
 
@@ -53,6 +59,7 @@ func main() {
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			logger.Error().Err(err).Msg("shutdown error")
 		}
+		rootCancel()
 		if res.Valkey != nil {
 			res.Valkey.Close()
 		}

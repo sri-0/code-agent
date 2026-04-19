@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	"code-agent/internal/config"
+	"code-agent/internal/orchestrator"
 	"code-agent/pkg/db/valkey"
 	"code-agent/pkg/logging"
 	"code-agent/pkg/tasks"
@@ -23,6 +24,7 @@ type Result struct {
 	Logger zerolog.Logger
 	Valkey *valkey.Valkey
 	Tasks  tasks.Store
+	Orch   *orchestrator.Orchestrator
 }
 
 // Init loads env + YAML config, initialises logging, connects to valkey and
@@ -70,10 +72,16 @@ func Init(ctx context.Context) (*Result, error) {
 		}
 	}
 
+	orch, err := orchestrator.New(cfg, logger, taskStore)
+	if err != nil {
+		return nil, fmt.Errorf("orchestrator: %w", err)
+	}
+
 	return &Result{
 		Cfg:    cfg,
 		Logger: logger,
 		Valkey: vk,
 		Tasks:  taskStore,
+		Orch:   orch,
 	}, nil
 }
