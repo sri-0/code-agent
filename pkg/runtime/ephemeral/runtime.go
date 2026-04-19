@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -63,17 +64,22 @@ func (r *Runtime) EnsureWorker(ctx context.Context, t *tasks.Task, b config.Boar
 		"CODE_AGENT_TASK_ID":       t.ID,
 		"CODE_AGENT_BOARD_ID":      b.ID,
 		"CODE_AGENT_EXTERNAL_ID":   t.ExternalID,
+		"CODE_AGENT_RUNTIME_MODE":  "ephemeral",
 	}
 	// pass repos as comma-separated list of name=url@base_branch
 	if len(t.Repos) > 0 {
-		var s string
+		var sb strings.Builder
 		for i, repo := range t.Repos {
 			if i > 0 {
-				s += ","
+				sb.WriteByte(',')
 			}
-			s += repo.Name + "=" + repo.URL + "@" + repo.BaseBranch
+			sb.WriteString(repo.Name)
+			sb.WriteByte('=')
+			sb.WriteString(repo.URL)
+			sb.WriteByte('@')
+			sb.WriteString(repo.BaseBranch)
 		}
-		env["CODE_AGENT_REPOS"] = s
+		env["CODE_AGENT_REPOS"] = sb.String()
 	}
 
 	spec := k8s.JobSpec{

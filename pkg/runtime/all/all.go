@@ -7,4 +7,6 @@ package all
 import (
 	_ "code-agent/pkg/runtime/ephemeral"
 	_ "code-agent/pkg/runtime/local"
+	_ "code-agent/pkg/runtime/persistent"
+	_ "code-agent/pkg/runtime/shared"
 )

@@ -23,6 +23,23 @@ runtimes:
       env: OPENCODE_SERVER_PASSWORD
     workdir: ./.workspaces
 
+  persistent:
+    mode: persistent
+    namespace: code-agent
+    image: ghcr.io/your-org/code-agent-worker:latest
+    idle_timeout: 6h
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        cpu: "2"
+        memory: 4Gi
+    ingress:
+      enabled: true
+      host_template: task-{{.ExtID}}.opencode.internal
+      tls_secret: opencode-wildcard
+
   shared:
     mode: shared
     namespace: code-agent

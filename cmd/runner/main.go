@@ -1,29 +1,38 @@
 // cmd/runner is the PID-1 process inside the worker pod.
 //
 // Responsibilities:
-//  1. Parse CODE_AGENT_REPOS (comma-separated name=url@branch tuples) and
-//     clone each repo into /workspace/<name> with shell `git`.
-//  2. Write /workspace/opencode.json from CODE_AGENT_OPENCODE_CONFIG (raw
-//     JSON) if supplied, otherwise a minimal default pointing at /workspace.
-//  3. Exec `opencode serve` so it inherits PID 1 — that way `kubectl logs`
-//     and lifecycle signals go straight to opencode.
+//  1. In eager mode (ephemeral / persistent), parse CODE_AGENT_REPOS and
+//     clone each repo into /workspace/<name> with shell `git`. In shared
+//     mode (CODE_AGENT_RUNTIME_MODE=shared) skip upfront cloning — the
+//     orchestrator drives per-session clones via the admin HTTP below.
+//  2. Write /workspace/opencode.json (from CODE_AGENT_OPENCODE_CONFIG, or
+//     a minimal default pointing at /workspace).
+//  3. Start a small admin HTTP on CODE_AGENT_ADMIN_PORT (default 4100):
+//       POST /sessions/{id}/setup {repos:[{name,url,base_branch}]}
+//       DELETE /sessions/{id}
+//       GET  /healthz
+//     The orchestrator uses these to carve per-session subdirs in shared
+//     mode.
+//  4. Spawn `opencode serve` as a child process, forward stdout/stderr, and
+//     propagate SIGTERM/SIGINT. Exit with opencode's exit code.
 //
-// Repo credentials: if the env contains CODE_AGENT_GIT_TOKEN_<NAME>, we use
-// it as the HTTP basic auth password (with "x-access-token" as username) by
-// rewriting the URL. This keeps the tokens out of process args.
-//
-// The runner never phones home to the orchestrator; it just sets up the
-// filesystem and hands off to opencode. The orchestrator talks to opencode
-// over HTTP once its readiness probe succeeds.
+// Repo credentials: if CODE_AGENT_GIT_TOKEN_<UPPER_NAME> is set we inject
+// it as HTTP basic auth (user "x-access-token") by rewriting the URL.
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -33,10 +42,13 @@ const (
 	workspaceDir   = "/workspace"
 	opencodeConfig = "/workspace/opencode.json"
 	defaultPort    = "4096"
+	defaultAdmin   = "4100"
 )
 
 func main() {
-	logf("runner starting: task=%s board=%s ext=%s",
+	mode := os.Getenv("CODE_AGENT_RUNTIME_MODE") // ephemeral | persistent | shared
+	logf("runner starting: mode=%s task=%s board=%s ext=%s",
+		mode,
 		os.Getenv("CODE_AGENT_TASK_ID"),
 		os.Getenv("CODE_AGENT_BOARD_ID"),
 		os.Getenv("CODE_AGENT_EXTERNAL_ID"),
@@ -46,51 +58,177 @@ func main() {
 		fatalf("mkdir %s: %v", workspaceDir, err)
 	}
 
+	eager := mode != "shared"
 	repos, err := parseRepos(os.Getenv("CODE_AGENT_REPOS"))
 	if err != nil {
 		fatalf("parse CODE_AGENT_REPOS: %v", err)
 	}
-	for _, r := range repos {
-		dest := filepath.Join(workspaceDir, r.Name)
-		if _, err := os.Stat(filepath.Join(dest, ".git")); err == nil {
-			logf("repo %s already cloned; skipping", r.Name)
-			continue
-		}
-		if err := cloneRepo(r, dest); err != nil {
-			fatalf("clone %s: %v", r.Name, err)
+	if eager {
+		for _, r := range repos {
+			dest := filepath.Join(workspaceDir, r.Name)
+			if _, err := os.Stat(filepath.Join(dest, ".git")); err == nil {
+				logf("repo %s already cloned; skipping", r.Name)
+				continue
+			}
+			if err := cloneRepo(r, dest); err != nil {
+				fatalf("clone %s: %v", r.Name, err)
+			}
 		}
 	}
-
-	if err := writeOpenCodeConfig(repos); err != nil {
+	if err := writeOpenCodeConfig(repos, eager); err != nil {
 		fatalf("write opencode config: %v", err)
 	}
 
-	port := os.Getenv("OPENCODE_PORT")
-	if port == "" {
-		port = defaultPort
-	}
+	adminPort := envDefault("CODE_AGENT_ADMIN_PORT", defaultAdmin)
+	adminSrv := startAdminHTTP(adminPort)
+
+	ocPort := envDefault("OPENCODE_PORT", defaultPort)
 	bin, err := exec.LookPath("opencode")
 	if err != nil {
 		fatalf("opencode binary not found on PATH: %v", err)
 	}
-	args := []string{
-		"opencode", "serve",
-		"--port", port,
-		"--hostname", "0.0.0.0",
+	cmd := exec.Command(bin, "serve", "--port", ocPort, "--hostname", "0.0.0.0")
+	cmd.Env = append(os.Environ(), "OPENCODE_CONFIG="+opencodeConfig)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		fatalf("start opencode: %v", err)
 	}
-	logf("exec %s %s", bin, strings.Join(args[1:], " "))
-	env := append(os.Environ(), "OPENCODE_CONFIG="+opencodeConfig)
-	// execve: replace the runner so opencode is PID 1.
-	if err := syscall.Exec(bin, args, env); err != nil {
-		fatalf("exec opencode: %v", err)
+	logf("opencode pid=%d port=%s", cmd.Process.Pid, ocPort)
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+
+	waitCh := make(chan error, 1)
+	go func() { waitCh <- cmd.Wait() }()
+
+	var exitCode int
+	select {
+	case sig := <-sigCh:
+		logf("received %s; forwarding to opencode", sig)
+		_ = cmd.Process.Signal(sig)
+		select {
+		case err := <-waitCh:
+			exitCode = exitCodeOf(err)
+		case <-time.After(15 * time.Second):
+			logf("opencode did not exit in 15s; killing")
+			_ = cmd.Process.Kill()
+			<-waitCh
+			exitCode = 137
+		}
+	case err := <-waitCh:
+		exitCode = exitCodeOf(err)
+		logf("opencode exited: code=%d err=%v", exitCode, err)
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = adminSrv.Shutdown(shutdownCtx)
+	os.Exit(exitCode)
+}
+
+// ---- admin HTTP ----
+
+type setupReq struct {
+	Repos []repo `json:"repos"`
+}
+
+func startAdminHTTP(port string) *http.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, "ok")
+	})
+	mux.HandleFunc("/sessions/", handleSessions)
+
+	srv := &http.Server{Addr: ":" + port, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	ln, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		fatalf("admin listen %s: %v", srv.Addr, err)
+	}
+	go func() {
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			logf("admin http: %v", err)
+		}
+	}()
+	logf("admin http listening on %s", srv.Addr)
+	return srv
+}
+
+// /sessions/{id}/setup     POST   — clone repos into /workspace/{id}/<name>
+// /sessions/{id}           DELETE — rm -rf /workspace/{id}
+func handleSessions(w http.ResponseWriter, r *http.Request) {
+	// strip prefix
+	p := strings.TrimPrefix(r.URL.Path, "/sessions/")
+	parts := strings.SplitN(p, "/", 2)
+	if len(parts) == 0 || parts[0] == "" {
+		http.Error(w, "session id required", 400)
+		return
+	}
+	sid := parts[0]
+	if !validSessionID(sid) {
+		http.Error(w, "invalid session id", 400)
+		return
+	}
+	sub := ""
+	if len(parts) == 2 {
+		sub = parts[1]
+	}
+
+	switch {
+	case r.Method == http.MethodPost && sub == "setup":
+		handleSetup(w, r, sid)
+	case r.Method == http.MethodDelete && sub == "":
+		handleDelete(w, r, sid)
+	default:
+		http.Error(w, "not found", 404)
 	}
 }
 
-// repo describes one cloned repo.
+var sessionIDRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
+
+func validSessionID(s string) bool { return sessionIDRe.MatchString(s) }
+
+func handleSetup(w http.ResponseWriter, r *http.Request, sid string) {
+	var req setupReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad body: "+err.Error(), 400)
+		return
+	}
+	base := filepath.Join(workspaceDir, sid)
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		http.Error(w, "mkdir: "+err.Error(), 500)
+		return
+	}
+	for _, rp := range req.Repos {
+		dest := filepath.Join(base, rp.Name)
+		if _, err := os.Stat(filepath.Join(dest, ".git")); err == nil {
+			continue
+		}
+		if err := cloneRepo(rp, dest); err != nil {
+			http.Error(w, "clone "+rp.Name+": "+err.Error(), 500)
+			return
+		}
+	}
+	w.WriteHeader(204)
+}
+
+func handleDelete(w http.ResponseWriter, _ *http.Request, sid string) {
+	base := filepath.Join(workspaceDir, sid)
+	if err := os.RemoveAll(base); err != nil {
+		http.Error(w, "rm: "+err.Error(), 500)
+		return
+	}
+	w.WriteHeader(204)
+}
+
+// ---- setup helpers ----
+
 type repo struct {
-	Name       string
-	URL        string
-	BaseBranch string
+	Name       string `json:"name"`
+	URL        string `json:"url"`
+	BaseBranch string `json:"base_branch"`
 }
 
 func parseRepos(s string) ([]repo, error) {
@@ -122,14 +260,12 @@ func parseRepos(s string) ([]repo, error) {
 
 func cloneRepo(r repo, dest string) error {
 	cloneURL := r.URL
-	// token injection: if CODE_AGENT_GIT_TOKEN_<UPPER_NAME> is set, use it.
 	tokEnv := "CODE_AGENT_GIT_TOKEN_" + strings.ToUpper(strings.ReplaceAll(r.Name, "-", "_"))
 	if tok := os.Getenv(tokEnv); tok != "" {
 		if rewritten, ok := urlWithToken(cloneURL, tok); ok {
 			cloneURL = rewritten
 		}
 	}
-
 	args := []string{"clone", "--depth", "50"}
 	if r.BaseBranch != "" {
 		args = append(args, "-b", r.BaseBranch)
@@ -147,9 +283,6 @@ func cloneRepo(r repo, dest string) error {
 	return nil
 }
 
-// urlWithToken rewrites http(s) clone URLs with an access token. For SSH URLs
-// we give up and return ok=false (the caller should configure SSH in the image
-// instead).
 func urlWithToken(raw, token string) (string, bool) {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -162,7 +295,7 @@ func urlWithToken(raw, token string) (string, bool) {
 	return u.String(), true
 }
 
-func writeOpenCodeConfig(repos []repo) error {
+func writeOpenCodeConfig(repos []repo, eager bool) error {
 	if raw := os.Getenv("CODE_AGENT_OPENCODE_CONFIG"); raw != "" {
 		if !json.Valid([]byte(raw)) {
 			return fmt.Errorf("CODE_AGENT_OPENCODE_CONFIG is not valid JSON")
@@ -170,8 +303,10 @@ func writeOpenCodeConfig(repos []repo) error {
 		return os.WriteFile(opencodeConfig, []byte(raw), 0o644)
 	}
 	allowed := []string{workspaceDir}
-	for _, r := range repos {
-		allowed = append(allowed, filepath.Join(workspaceDir, r.Name))
+	if eager {
+		for _, r := range repos {
+			allowed = append(allowed, filepath.Join(workspaceDir, r.Name))
+		}
 	}
 	cfg := map[string]any{
 		"$schema": "https://opencode.ai/config.json",
@@ -185,6 +320,25 @@ func writeOpenCodeConfig(repos []repo) error {
 		return err
 	}
 	return os.WriteFile(opencodeConfig, b, 0o644)
+}
+
+// ---- misc ----
+
+func envDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func exitCodeOf(err error) int {
+	if err == nil {
+		return 0
+	}
+	if ee, ok := err.(*exec.ExitError); ok {
+		return ee.ExitCode()
+	}
+	return 1
 }
 
 func logf(format string, args ...any) {
