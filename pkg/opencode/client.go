@@ -27,13 +27,11 @@ type Options struct {
 }
 
 func New(opts Options, logger zerolog.Logger) *Client {
-	if opts.Timeout == 0 {
-		// 60s is generous for the short calls we make (session create,
-		// prompt_async submit, health). We never use the sync /message
-		// endpoint any more — long-running work is tracked via SSE after
-		// a fire-and-forget prompt_async.
-		opts.Timeout = 60 * time.Second
-	}
+	// Timeout=0 means "no hard cap" on the underlying http.Client — ctx
+	// is the only bound. Sync PostMessage uses a 45m action ctx; short
+	// calls (Health, CreateSession, etc.) wrap their own context with
+	// shorter deadlines at the call site.
+	// Callers that want a cap can pass opts.Timeout explicitly.
 	headers := map[string]string{}
 	if opts.Password != "" {
 		headers["Authorization"] = "Bearer " + opts.Password

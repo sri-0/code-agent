@@ -88,88 +88,58 @@ func (r *AgentRunner) Run(ctx context.Context, in stages.ActionInput) (stages.Ac
 	}
 	in.Task.SessionID = sessionID
 
-	// start streaming before posting so we don't miss early events
+	// Start SSE streaming for the transcript in the background. We no
+	// longer rely on SSE events for completion detection — the sync
+	// PostMessage below blocks until the full turn (including all tool
+	// calls and subagent work) is done. SSE is just for observability.
 	streamCtx, streamCancel := context.WithCancel(context.Background())
 	events, errs, err := client.Stream(streamCtx)
 	if err != nil {
 		streamCancel()
 		return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("stream: %w", err)
 	}
-
 	r.streamWG.Add(1)
-	terminalCh := make(chan string, 1)
-	go r.consumeStream(streamCtx, sessionID, events, errs, terminalCh, in)
+	go r.consumeStream(streamCtx, sessionID, events, errs, nil, in)
 
-	// Compose user message: include the ticket so the model has context.
+	// Compose user message and submit synchronously. PostMessage blocks
+	// until opencode is finished with this prompt. Bounded by the action
+	// ctx (stage.Timeout, ~45m). Abort on ctx cancellation.
 	userMsg := composeUserMessage(in.Task)
-	// Submit via /prompt_async — returns as soon as opencode queues the
-	// prompt, completion arrives through SSE. The older /message endpoint
-	// held the HTTP connection open for the full model turn (many minutes)
-	// which hit our timeouts.
-	postCtx, postCancel := context.WithTimeout(ctx, 60*time.Second)
-	err = client.PostMessageAsync(postCtx, sessionID, opencode.PostMessageRequest{
+	err = client.PostMessage(ctx, sessionID, opencode.PostMessageRequest{
 		ProviderID: in.Stage.Provider,
 		ModelID:    in.Stage.Model,
 		Mode:       in.Stage.Mode,
 		System:     in.Stage.SystemPrompt,
 		Parts:      []opencode.MessagePart{{Type: "text", Text: userMsg}},
 	})
-	postCancel()
+	streamCancel()
 	if err != nil {
-		streamCancel()
+		if ctx.Err() != nil {
+			abortCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = client.AbortSession(abortCtx, sessionID)
+			cancel()
+			return stages.ActionResult{Outcome: "failure"}, ctx.Err()
+		}
 		return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("post message: %w", err)
 	}
 
-	// Wait for the model to finish (terminal event) or for the action ctx
-	// to time out.
-	select {
-	case <-ctx.Done():
-		// best-effort abort
-		abortCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = client.AbortSession(abortCtx, sessionID)
-		cancel()
-		streamCancel()
-		return stages.ActionResult{Outcome: "failure"}, ctx.Err()
-	case outcome := <-terminalCh:
-		streamCancel()
-		// Look at the last assistant message for the NEEDS_MORE_INFO marker.
-		// If the agent emitted it, park the ticket: tag it, post the reason
-		// as a comment, and return failure — the boards.yaml exclude_tags
-		// filter stops us from re-entering until a human removes the tag.
-		fetchCtx, cancelFetch := context.WithTimeout(context.Background(), 15*time.Second)
-		lastText, _ := client.LastAssistantText(fetchCtx, sessionID)
-		cancelFetch()
-		if reason, ok := parseNeedsMoreInfo(lastText); ok {
-			in.Logger.Warn().Str("reason", reason).Msg("agent reported needs-more-info; tagging ticket")
-			tagCtx, cancelTag := context.WithTimeout(context.Background(), 15*time.Second)
-			if err := in.Provider.AddTag(tagCtx, in.Task.ExternalID, "needs-more-info"); err != nil {
-				in.Logger.Error().Err(err).Msg("failed to add needs-more-info tag")
-			}
-			cancelTag()
-			return stages.ActionResult{
-				Outcome: "failure",
-				Comment: "needs-more-info: " + reason,
-				Mutate: func(t *tasks.Task) {
-					t.SessionID = sessionID
-					t.WorkerRef = *ref
-					t.RuntimeMode = rt.Mode()
-				},
-			}, nil
+	// PostMessage returned cleanly → the turn is fully done. Inspect the
+	// last assistant message for sentinel markers (NEEDS_MORE_INFO /
+	// PLAN_START..PLAN_END).
+	fetchCtx, cancelFetch := context.WithTimeout(context.Background(), 15*time.Second)
+	lastText, _ := client.LastAssistantText(fetchCtx, sessionID)
+	cancelFetch()
+
+	if reason, ok := parseNeedsMoreInfo(lastText); ok {
+		in.Logger.Warn().Str("reason", reason).Msg("agent reported needs-more-info; tagging ticket")
+		tagCtx, cancelTag := context.WithTimeout(context.Background(), 15*time.Second)
+		if err := in.Provider.AddTag(tagCtx, in.Task.ExternalID, "needs-more-info"); err != nil {
+			in.Logger.Error().Err(err).Msg("failed to add needs-more-info tag")
 		}
-		// If the agent emitted a PLAN_START/PLAN_END block, write it to
-		// the ticket description so the next stage (and any human
-		// reviewer) has the plan as the source of truth.
-		if plan, ok := parsePlan(lastText); ok {
-			newDesc := formatPlanDescription(in.Task, plan)
-			in.Logger.Info().Int("bytes", len(newDesc)).Msg("updating ticket description with plan")
-			descCtx, cancelDesc := context.WithTimeout(context.Background(), 15*time.Second)
-			if err := in.Provider.UpdateDescription(descCtx, in.Task.ExternalID, newDesc); err != nil {
-				in.Logger.Error().Err(err).Msg("failed to update ticket description")
-			}
-			cancelDesc()
-		}
+		cancelTag()
 		return stages.ActionResult{
-			Outcome: outcome,
+			Outcome: "failure",
+			Comment: "needs-more-info: " + reason,
 			Mutate: func(t *tasks.Task) {
 				t.SessionID = sessionID
 				t.WorkerRef = *ref
@@ -177,6 +147,23 @@ func (r *AgentRunner) Run(ctx context.Context, in stages.ActionInput) (stages.Ac
 			},
 		}, nil
 	}
+	if plan, ok := parsePlan(lastText); ok {
+		newDesc := formatPlanDescription(in.Task, plan)
+		in.Logger.Info().Int("bytes", len(newDesc)).Msg("updating ticket description with plan")
+		descCtx, cancelDesc := context.WithTimeout(context.Background(), 15*time.Second)
+		if err := in.Provider.UpdateDescription(descCtx, in.Task.ExternalID, newDesc); err != nil {
+			in.Logger.Error().Err(err).Msg("failed to update ticket description")
+		}
+		cancelDesc()
+	}
+	return stages.ActionResult{
+		Outcome: "success",
+		Mutate: func(t *tasks.Task) {
+			t.SessionID = sessionID
+			t.WorkerRef = *ref
+			t.RuntimeMode = rt.Mode()
+		},
+	}, nil
 }
 
 // parsePlan extracts the markdown between PLAN_START / PLAN_END sentinel
@@ -236,6 +223,9 @@ func parseNeedsMoreInfo(text string) (string, bool) {
 	return "", false
 }
 
+// consumeStream drains SSE events into the transcript store. No longer
+// used for completion detection — sync PostMessage blocks until the turn
+// is actually done. terminalCh is accepted but may be nil.
 func (r *AgentRunner) consumeStream(ctx context.Context, sessionID string, events <-chan opencode.Event, errs <-chan error, terminalCh chan<- string, in stages.ActionInput) {
 	defer r.streamWG.Done()
 
@@ -244,7 +234,7 @@ func (r *AgentRunner) consumeStream(ctx context.Context, sessionID string, event
 
 	terminalSent := false
 	sendTerminal := func(outcome string) {
-		if terminalSent {
+		if terminalSent || terminalCh == nil {
 			return
 		}
 		terminalSent = true
