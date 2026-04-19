@@ -32,10 +32,12 @@ func main() {
 	}
 
 	router := server.NewRouter(server.Deps{
-		Version: version,
-		Tasks:   res.Tasks,
-		Orch:    res.Orch,
-		Logger:  logger,
+		Version:    version,
+		Cfg:        cfg,
+		Tasks:      res.Tasks,
+		Transcript: res.Transcript,
+		Orch:       res.Orch,
+		Logger:     logger,
 	})
 
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)

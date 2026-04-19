@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>task {{.Task.ExternalID}} — code-agent</title>
+  <style>
+    body { font: 14px/1.4 -apple-system, Segoe UI, sans-serif; margin: 24px; background: #fafafa; color: #222; max-width: 1000px; }
+    h1 { margin: 0 0 4px; font-size: 20px; }
+    h2 { margin: 20px 0 8px; font-size: 14px; color: #555; text-transform: uppercase; letter-spacing: .04em; }
+    table { border-collapse: collapse; background: #fff; }
+    th, td { padding: 6px 10px; border-bottom: 1px solid #eee; text-align: left; font-size: 13px; }
+    th { background: #f4f4f4; font-weight: 600; }
+    code { font-family: ui-monospace, Menlo, monospace; font-size: 13px; }
+    pre { background: #fff; border: 1px solid #eee; border-radius: 4px; padding: 10px; overflow-x: auto; max-height: 400px; font-size: 12px; }
+    .muted { color: #888; }
+    a { color: #246; }
+  </style>
+</head>
+<body>
+  <p><a href="/">&larr; all tasks</a></p>
+  <h1>{{.Task.ExternalID}} — {{.Task.Title}}</h1>
+  <p class="muted">
+    board <code>{{.Task.BoardID}}</code> ·
+    stage <code>{{.Task.Stage}}</code> ·
+    runtime <code>{{.Task.RuntimeMode}}</code> ·
+    {{if .Task.URL}}<a href="{{.Task.URL}}">ticket</a>{{end}}
+  </p>
+
+  <h2>Worker</h2>
+  <table>
+    <tr><th>Mode</th><td>{{.Task.WorkerRef.Mode}}</td></tr>
+    <tr><th>Namespace</th><td>{{.Task.WorkerRef.Namespace}}</td></tr>
+    <tr><th>Name</th><td><code>{{.Task.WorkerRef.Name}}</code></td></tr>
+    <tr><th>Pod</th><td><code>{{.Task.WorkerRef.Pod}}</code></td></tr>
+    <tr><th>URL</th><td><code>{{.Task.WorkerRef.URL}}</code></td></tr>
+    {{if .Task.WorkerRef.UIURL}}<tr><th>UI</th><td><a href="{{.Task.WorkerRef.UIURL}}">{{.Task.WorkerRef.UIURL}}</a></td></tr>{{end}}
+    <tr><th>Session</th><td><code>{{.Task.SessionID}}</code></td></tr>
+  </table>
+
+  <h2>Repos</h2>
+  <table>
+    <thead><tr><th>Name</th><th>URL</th><th>Base</th><th>Branch</th></tr></thead>
+    <tbody>
+    {{range .Task.Repos}}
+      <tr><td>{{.Name}}</td><td><code>{{.URL}}</code></td><td>{{.BaseBranch}}</td><td><code>{{.Branch}}</code></td></tr>
+    {{end}}
+    </tbody>
+  </table>
+
+  {{if .Task.MergeRequests}}
+  <h2>Merge/Pull Requests</h2>
+  <table>
+    <thead><tr><th>Repo</th><th>State</th><th>URL</th></tr></thead>
+    <tbody>
+    {{range .Task.MergeRequests}}
+      <tr><td>{{.Repo}}</td><td>{{.State}}</td><td><a href="{{.URL}}">{{.URL}}</a></td></tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{end}}
+
+  {{if .Events}}
+  <h2>Transcript ({{len .Events}} events, last updated {{.Meta.LastAt.Format "2006-01-02 15:04:05"}})</h2>
+  <pre>{{range .Events}}{{.}}
+{{end}}</pre>
+  {{end}}
+</body>
+</html>

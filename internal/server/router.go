@@ -3,20 +3,25 @@ package server
 import (
 	"net/http"
 
+	"github.com/gorilla/mux"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/rs/zerolog"
+
+	"code-agent/internal/config"
 	"code-agent/internal/handler"
 	"code-agent/internal/orchestrator"
 	"code-agent/pkg/logging"
 	"code-agent/pkg/tasks"
-
-	"github.com/gorilla/mux"
-	"github.com/rs/zerolog"
+	"code-agent/pkg/transcript"
 )
 
 type Deps struct {
-	Version string
-	Tasks   tasks.Store
-	Orch    *orchestrator.Orchestrator
-	Logger  zerolog.Logger
+	Version    string
+	Cfg        *config.Config
+	Tasks      tasks.Store
+	Transcript transcript.Store
+	Orch       *orchestrator.Orchestrator
+	Logger     zerolog.Logger
 }
 
 // NewRouter builds the top-level HTTP router.
@@ -30,11 +35,29 @@ func NewRouter(d Deps) http.Handler {
 		Logger:  d.Logger,
 	}).Methods(http.MethodGet)
 
+	// Prometheus metrics — no logging middleware noise.
+	r.Handle("/metrics", promhttp.Handler()).Methods(http.MethodGet)
+
 	if d.Orch != nil {
 		r.Handle("/webhooks/{board}", &handler.WebhookHandler{
 			Orch:   d.Orch,
 			Logger: d.Logger,
 		}).Methods(http.MethodPost)
+	}
+
+	// Operator API — JSON.
+	if d.Cfg != nil && d.Tasks != nil {
+		api := r.PathPrefix("/api").Subrouter()
+		(&handler.APIHandler{
+			Cfg:        d.Cfg,
+			Tasks:      d.Tasks,
+			Transcript: d.Transcript,
+			Orch:       d.Orch,
+			Logger:     d.Logger,
+		}).Mount(api)
+
+		dash := handler.NewDashboardHandler(d.Cfg, d.Tasks, d.Transcript, d.Logger)
+		dash.Mount(r)
 	}
 
 	return r

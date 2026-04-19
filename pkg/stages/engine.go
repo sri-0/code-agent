@@ -21,6 +21,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"code-agent/internal/config"
+	"code-agent/pkg/metrics"
 	"code-agent/pkg/providers"
 	"code-agent/pkg/tasks"
 )
@@ -208,6 +209,7 @@ func (e *Engine) runAction(ctx context.Context, t *tasks.Task, b config.Board, s
 	actCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	actStart := time.Now()
 	res, err := r.Run(actCtx, ActionInput{
 		Task:     t,
 		Stage:    stg,
@@ -215,6 +217,12 @@ func (e *Engine) runAction(ctx context.Context, t *tasks.Task, b config.Board, s
 		Provider: prov,
 		Logger:   e.logger.With().Str("task", t.ID).Str("stage", stg.Name).Logger(),
 	})
+	metrics.ActionDurationSeconds.WithLabelValues(stg.Action).Observe(time.Since(actStart).Seconds())
+	outcomeLabel := res.Outcome
+	if outcomeLabel == "" {
+		outcomeLabel = "unknown"
+	}
+	metrics.ActionRunsTotal.WithLabelValues(stg.Action, outcomeLabel).Inc()
 	if err == ErrAsync || res.Outcome == "async" {
 		return nil // runner will call Advance later
 	}
@@ -285,6 +293,7 @@ func (e *Engine) advance(ctx context.Context, t *tasks.Task, b config.Board, stg
 			// keep going; we still flip our local stage so we don't loop
 		}
 	}
+	metrics.StageTransitionsTotal.WithLabelValues(b.ID, stg.Name, next.Name, outcome).Inc()
 	t.Stage = next.Name
 	t.StageStarted = time.Now()
 	t.UpdatedAt = time.Now()

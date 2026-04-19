@@ -39,6 +39,25 @@ Build a Go orchestrator service at `~/code/code-agent` that drives OpenCode AI c
 - Final approved plan v3 has 4 runtime modes and phased build order (Phase 1 scaffolding → Phase 8 CLI/metrics).
 - `go build ./...` was attempted after `go mod tidy` succeeded; the first couple of attempts had tool "Stream closed" errors and the build result is **not yet confirmed**. Next agent should re-run `go build ./...` first thing.
 
+## Status (2026-04-19)
+
+Phases 1–8 implemented and building clean (`go build ./...`, `go vet ./...`).
+Binaries `bin/{server,cli,runner}` all compile. No tests yet (Phase 9
+candidate).
+
+- Phase 1 — scaffolding (commit 0e71bcf)
+- Phase 2 — providers (commit f4429d9)
+- Phase 3 — stages engine + opencode HTTP+SSE + transcript (commit 89e9577)
+- Phase 4 — local runtime + run_agent runner (commit ece56d9)
+- Phase 5 — ephemeral k8s runtime + worker image + cmd/runner supervisor
+  (commit 778fe03)
+- Phase 6 — persistent + shared runtimes, admin HTTP on :4100 for shared
+  per-session clones (commit 88b1bbe)
+- Phase 7 — VCS (gitlab + github), pkg/git ls-remote check, open_mr
+  ActionRunner with per-repo cross-linking (commit bcb21aa)
+- Phase 8 — operator CLI, JSON API under /api, read-only HTML dashboard,
+  Prometheus /metrics (this commit)
+
 ## Accomplished — Phase 1 scaffolding (build not yet verified)
 
 - Repo directory tree created (`cmd/{server,cli,runner}`, `internal/{bootstrap,config,orchestrator,handler,server}`, `pkg/{logging,httpclient,db/valkey,providers/{jira,clickup},vcs/{gitlab,github},git,opencode,k8s,stages,runtime/{local,ephemeral,persistent,shared},tasks/valkey,transcript}`, `config/default`, `deploy/k8s`, `docker/opencode`, `test`), `git init` done.

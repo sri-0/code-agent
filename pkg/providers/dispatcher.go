@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+
+	"code-agent/pkg/metrics"
 )
 
 // Dispatcher fans events from many BoardProviders into a single channel,
@@ -108,6 +110,7 @@ func (d *Dispatcher) emit(e Event) {
 		d.seen[e.Key] = time.Now()
 		d.mu.Unlock()
 	}
+	metrics.EventsTotal.WithLabelValues(e.BoardID, e.Provider, e.Source, e.Type).Inc()
 	select {
 	case d.out <- e:
 	default:
