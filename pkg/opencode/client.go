@@ -84,6 +84,22 @@ func (c *Client) CurrentProject(ctx context.Context) (*Project, error) {
 	return &p, nil
 }
 
+// ConfigSnapshot is the subset of GET /config we care about. Anything we
+// don't decode is ignored.
+type ConfigSnapshot struct {
+	Model      string            `json:"model"`
+	Permission map[string]string `json:"permission"`
+}
+
+// Config fetches the server's effective config.
+func (c *Client) Config(ctx context.Context) (*ConfigSnapshot, error) {
+	var s ConfigSnapshot
+	if err := c.http.Do(ctx, http.MethodGet, "/config", nil, &s, nil); err != nil {
+		return nil, fmt.Errorf("get config: %w", err)
+	}
+	return &s, nil
+}
+
 // EnsureGitProject calls POST /project/git/init which runs `git init` in
 // opencode's current worktree. This is a no-op if the dir is already a git
 // repo. Returns the resulting project — if its id is "global" it means

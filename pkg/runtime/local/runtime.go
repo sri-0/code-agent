@@ -72,6 +72,31 @@ func (r *Runtime) EnsureWorker(ctx context.Context, t *tasks.Task, _ config.Boar
 					Msg("local runtime: opencode project ready")
 			}
 		}
+
+		// Check permissions: anything not set to "allow" will prompt the
+		// operator mid-run. We can't edit opencode's config file from here
+		// safely (ownership + restart required), so we warn loudly. Keys
+		// we expect to be "allow": read, write, edit, bash, webfetch,
+		// patch, task.
+		if cfg, err := r.client.Config(ctx); err != nil {
+			r.logger.Warn().Err(err).Msg("local runtime: could not fetch opencode config for permission check")
+		} else {
+			wanted := []string{"read", "write", "edit", "bash", "webfetch", "patch", "task"}
+			var missing []string
+			for _, k := range wanted {
+				v, ok := cfg.Permission[k]
+				if !ok || v != "allow" {
+					missing = append(missing, k+"="+orDash(v))
+				}
+			}
+			if len(missing) > 0 {
+				r.logger.Warn().
+					Strs("missing_or_non_allow", missing).
+					Msg("local runtime: opencode permissions will prompt the operator. Set these to \"allow\" in ~/.config/opencode/opencode.json \"permission\" block and restart opencode.")
+			} else {
+				r.logger.Info().Msg("local runtime: opencode permissions look good (read/write/edit/bash/webfetch/patch/task all allow)")
+			}
+		}
 	}
 	ref := &tasks.WorkerRef{
 		Mode:     "local",
@@ -121,6 +146,13 @@ func (r *Runtime) EnsureSession(ctx context.Context, client *opencode.Client, t 
 }
 
 func (r *Runtime) Cleanup(_ context.Context, _ *tasks.Task) error { return nil }
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
 
 func init() {
 	runtime.Register("local", func(name string, cfg config.Runtime, deps runtime.Deps) (runtime.Runtime, error) {
