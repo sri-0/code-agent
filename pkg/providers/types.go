@@ -64,6 +64,10 @@ type BoardProvider interface {
 	Transition(ctx context.Context, externalID, targetStatus string) error
 	// Comment posts a comment on the ticket.
 	Comment(ctx context.Context, externalID string, c Comment) error
+	// AddTag attaches a tag/label to the ticket. Used by run_agent to mark
+	// tickets it parks (e.g. "needs-more-info"). Idempotent: attaching an
+	// already-present tag should not error.
+	AddTag(ctx context.Context, externalID, tag string) error
 
 	// HandleWebhook validates and parses a webhook request, emitting any
 	// resulting events on out. Implementations write the HTTP response.

@@ -86,13 +86,19 @@ func (r *AgentRunner) Run(ctx context.Context, in stages.ActionInput) (stages.Ac
 
 	// Compose user message: include the ticket so the model has context.
 	userMsg := composeUserMessage(in.Task)
-	// POST /session/{id}/message on opencode is synchronous — it blocks
-	// until the model finishes. Use the action ctx (stage.Timeout, ~45m)
-	// as the bound rather than a 30s wrap.
-	err = client.PostMessage(ctx, sessionID, opencode.PostMessageRequest{
-		System: in.Stage.SystemPrompt,
-		Parts:  []opencode.MessagePart{{Type: "text", Text: userMsg}},
+	// Submit via /prompt_async — returns as soon as opencode queues the
+	// prompt, completion arrives through SSE. The older /message endpoint
+	// held the HTTP connection open for the full model turn (many minutes)
+	// which hit our timeouts.
+	postCtx, postCancel := context.WithTimeout(ctx, 60*time.Second)
+	err = client.PostMessageAsync(postCtx, sessionID, opencode.PostMessageRequest{
+		ProviderID: in.Stage.Provider,
+		ModelID:    in.Stage.Model,
+		Mode:       in.Stage.Mode,
+		System:     in.Stage.SystemPrompt,
+		Parts:      []opencode.MessagePart{{Type: "text", Text: userMsg}},
 	})
+	postCancel()
 	if err != nil {
 		streamCancel()
 		return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("post message: %w", err)
@@ -110,6 +116,30 @@ func (r *AgentRunner) Run(ctx context.Context, in stages.ActionInput) (stages.Ac
 		return stages.ActionResult{Outcome: "failure"}, ctx.Err()
 	case outcome := <-terminalCh:
 		streamCancel()
+		// Look at the last assistant message for the NEEDS_MORE_INFO marker.
+		// If the agent emitted it, park the ticket: tag it, post the reason
+		// as a comment, and return failure — the boards.yaml exclude_tags
+		// filter stops us from re-entering until a human removes the tag.
+		fetchCtx, cancelFetch := context.WithTimeout(context.Background(), 15*time.Second)
+		lastText, _ := client.LastAssistantText(fetchCtx, sessionID)
+		cancelFetch()
+		if reason, ok := parseNeedsMoreInfo(lastText); ok {
+			in.Logger.Warn().Str("reason", reason).Msg("agent reported needs-more-info; tagging ticket")
+			tagCtx, cancelTag := context.WithTimeout(context.Background(), 15*time.Second)
+			if err := in.Provider.AddTag(tagCtx, in.Task.ExternalID, "needs-more-info"); err != nil {
+				in.Logger.Error().Err(err).Msg("failed to add needs-more-info tag")
+			}
+			cancelTag()
+			return stages.ActionResult{
+				Outcome: "failure",
+				Comment: "needs-more-info: " + reason,
+				Mutate: func(t *tasks.Task) {
+					t.SessionID = sessionID
+					t.WorkerRef = *ref
+					t.RuntimeMode = rt.Mode()
+				},
+			}, nil
+		}
 		return stages.ActionResult{
 			Outcome: outcome,
 			Mutate: func(t *tasks.Task) {
@@ -119,6 +149,20 @@ func (r *AgentRunner) Run(ctx context.Context, in stages.ActionInput) (stages.Ac
 			},
 		}, nil
 	}
+}
+
+// parseNeedsMoreInfo returns the reason and true if the assistant's final
+// text contains a line beginning with "NEEDS_MORE_INFO:". The marker must
+// be on its own line so we don't trip on discussion that mentions the
+// string incidentally.
+func parseNeedsMoreInfo(text string) (string, bool) {
+	for line := range strings.SplitSeq(strings.TrimSpace(text), "\n") {
+		line = strings.TrimSpace(line)
+		if rest, ok := strings.CutPrefix(line, "NEEDS_MORE_INFO:"); ok {
+			return strings.TrimSpace(rest), true
+		}
+	}
+	return "", false
 }
 
 func (r *AgentRunner) consumeStream(ctx context.Context, sessionID string, events <-chan opencode.Event, errs <-chan error, terminalCh chan<- string, in stages.ActionInput) {
@@ -178,6 +222,9 @@ func (r *AgentRunner) consumeStream(ctx context.Context, sessionID string, event
 }
 
 func composeUserMessage(t *tasks.Task) string {
+	// Deliberately omit t.URL — private ticket URLs trigger the model's
+	// WebSearch tool and waste calls on pages it can't reach. The agent
+	// should plan from the text body + codebase alone.
 	var sb strings.Builder
 	sb.WriteString("Ticket: ")
 	sb.WriteString(t.ExternalID)
@@ -186,11 +233,6 @@ func composeUserMessage(t *tasks.Task) string {
 		sb.WriteString(t.Title)
 	}
 	sb.WriteString("\n\n")
-	if t.URL != "" {
-		sb.WriteString("Link: ")
-		sb.WriteString(t.URL)
-		sb.WriteString("\n\n")
-	}
 	if t.Description != "" {
 		sb.WriteString(t.Description)
 	}

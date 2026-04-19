@@ -246,6 +246,19 @@ func (p *Provider) Comment(ctx context.Context, externalID string, c providers.C
 	return p.http.Do(ctx, http.MethodPost, "/rest/api/3/issue/"+externalID+"/comment", body, nil, nil)
 }
 
+// AddTag adds a label to a Jira issue. Jira calls these "labels" rather
+// than tags; we present them under the same interface.
+func (p *Provider) AddTag(ctx context.Context, externalID, tag string) error {
+	body := map[string]any{
+		"update": map[string]any{
+			"labels": []any{
+				map[string]any{"add": tag},
+			},
+		},
+	}
+	return p.http.Do(ctx, http.MethodPut, "/rest/api/3/issue/"+externalID, body, nil, nil)
+}
+
 // urlQuery is a minimal escaper for the JQL query string. We keep it local to
 // avoid pulling in net/url for a single call site.
 func urlQuery(s string) string {

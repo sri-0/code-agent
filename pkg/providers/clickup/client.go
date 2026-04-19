@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -127,6 +128,17 @@ func (p *Provider) matchesFilters(t providers.Ticket) bool {
 			return false
 		}
 	}
+	if len(p.board.Filters.ExcludeTags) > 0 {
+		bad := map[string]bool{}
+		for _, l := range p.board.Filters.ExcludeTags {
+			bad[strings.ToLower(l)] = true
+		}
+		for _, l := range t.Labels {
+			if bad[strings.ToLower(l)] {
+				return false
+			}
+		}
+	}
 	return true
 }
 
@@ -172,4 +184,13 @@ func (p *Provider) Comment(ctx context.Context, externalID string, c providers.C
 		"notify_all":   false,
 	}
 	return p.http.Do(ctx, http.MethodPost, "/task/"+externalID+"/comment", body, nil, nil)
+}
+
+// AddTag attaches an existing space-level tag to the task. ClickUp returns
+// success even if the tag was already attached. If the tag doesn't exist at
+// space level, this errors — the caller should pre-create the tag.
+func (p *Provider) AddTag(ctx context.Context, externalID, tag string) error {
+	// URL-escape the tag name (spaces, etc.)
+	path := "/task/" + externalID + "/tag/" + url.PathEscape(tag)
+	return p.http.Do(ctx, http.MethodPost, path, nil, nil, nil)
 }

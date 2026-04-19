@@ -39,7 +39,8 @@ func (e EnvRef) Value() string { return os.Getenv(e.Env) }
 type BoardFilters struct {
 	Labels        []string `yaml:"labels,omitempty"`
 	ExcludeLabels []string `yaml:"exclude_labels,omitempty"`
-	Tags          []string `yaml:"tags,omitempty"` // clickup
+	Tags          []string `yaml:"tags,omitempty"`         // clickup
+	ExcludeTags   []string `yaml:"exclude_tags,omitempty"` // clickup — skip tickets carrying any of these tags
 }
 
 type BoardTriggers struct {

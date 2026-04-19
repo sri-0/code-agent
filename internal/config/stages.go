@@ -18,13 +18,18 @@ type Stage struct {
 	Action         string        `yaml:"action"`                 // noop | run_agent | open_mr | comment | comment_error | wait_for_review | run_shell
 	RuntimeMode    string        `yaml:"runtime_mode,omitempty"` // override runtime for this stage
 	SystemPrompt   string        `yaml:"system_prompt,omitempty"`
-	Next           string        `yaml:"next,omitempty"` // for action=noop
-	SuccessNext    string        `yaml:"success_next,omitempty"`
-	FailureNext    string        `yaml:"failure_next,omitempty"`
-	Terminal       bool          `yaml:"terminal,omitempty"`
-	Timeout        time.Duration `yaml:"timeout,omitempty"`
-	MaxRetries     int           `yaml:"max_retries,omitempty"`
-	MRTemplate     string        `yaml:"mr_template,omitempty"` // for action=open_mr
+	// Opencode model selection for run_agent. Both optional: if empty,
+	// opencode's default provider/model is used.
+	Provider   string        `yaml:"provider,omitempty"` // e.g. "openrouter", "anthropic"
+	Model      string        `yaml:"model,omitempty"`    // e.g. "anthropic/claude-opus-4.7"
+	Mode       string        `yaml:"mode,omitempty"`     // opencode agent mode, e.g. "build"
+	Next       string        `yaml:"next,omitempty"`     // for action=noop
+	SuccessNext string       `yaml:"success_next,omitempty"`
+	FailureNext string       `yaml:"failure_next,omitempty"`
+	Terminal   bool          `yaml:"terminal,omitempty"`
+	Timeout    time.Duration `yaml:"timeout,omitempty"`
+	MaxRetries int           `yaml:"max_retries,omitempty"`
+	MRTemplate string        `yaml:"mr_template,omitempty"` // for action=open_mr
 }
 
 func LoadStages(path string) (*StagesConfig, error) {
