@@ -2,10 +2,11 @@
 // neatly in pkg/runtime (which is for runtime-adjacent actions like
 // run_agent). Each action is standalone and registered in the orchestrator.
 //
-// Current: OpenMRRunner — iterates the task's repos, verifies the remote
-// branch exists, opens one MR/PR per repo via the appropriate vcs.Client,
-// then posts a cross-link comment on each side if more than one MR was
-// created.
+// OpenMRRunner is the "commit → push → open PR" action. It's orchestrator-
+// driven: the agent leaves modified/created files on disk, this action
+// detects them, generates a commit message and PR body via an LLM call
+// (pkg/llm), commits + pushes to ai/<ticket-id> per repo, and opens a PR
+// against the configured base branch.
 package actions
 
 import (
@@ -13,31 +14,39 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
-	"text/template"
 	"time"
 
 	"github.com/rs/zerolog"
 
 	"code-agent/internal/config"
-	"code-agent/pkg/git"
+	"code-agent/pkg/llm"
 	"code-agent/pkg/stages"
 	"code-agent/pkg/tasks"
 	"code-agent/pkg/vcs"
 )
 
-// OpenMRRunner opens merge/pull requests for a task.
-//
-// VCS clients are cached by repo name per-runner (keyed on board+repo
-// name; collisions across boards are fine since repo configs are the same).
+// OpenMRRunner commits + pushes + opens PRs for a task. VCS clients and the
+// LLM client are cached per-runner.
 type OpenMRRunner struct {
 	mu      sync.Mutex
 	clients map[string]vcs.Client // repo_name -> client
+	llm     *llm.Client           // nil if no API key configured
+	llmErr  error
 }
 
 func NewOpenMRRunner() *OpenMRRunner {
-	return &OpenMRRunner{clients: map[string]vcs.Client{}}
+	r := &OpenMRRunner{clients: map[string]vcs.Client{}}
+	c, err := llm.New(llm.Options{})
+	if err != nil {
+		r.llmErr = err
+	} else {
+		r.llm = c
+	}
+	return r
 }
 
 // Run satisfies stages.ActionRunner.
@@ -48,57 +57,119 @@ func (r *OpenMRRunner) Run(ctx context.Context, in stages.ActionInput) (stages.A
 		return stages.ActionResult{Outcome: "success", Comment: "open_mr: no repos configured"}, nil
 	}
 
-	tmpl, err := parseMRTemplate(in.Stage.MRTemplate)
-	if err != nil {
-		return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("template: %w", err)
+	workspace := os.Getenv("CODE_AGENT_WORKSPACE")
+	if workspace == "" {
+		return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("CODE_AGENT_WORKSPACE env not set — cannot locate repos on disk")
+	}
+
+	if r.llm == nil {
+		logger.Warn().Err(r.llmErr).Msg("LLM client unavailable; falling back to template commit/pr text")
 	}
 
 	var opened []vcs.MergeRequest
 	var newRefs []tasks.MergeRef
+	var summary bytes.Buffer
 
-	for i, rp := range in.Task.Repos {
+	for _, rp := range in.Task.Repos {
+		repoDir := filepath.Join(workspace, rp.Name)
+		if _, err := os.Stat(filepath.Join(repoDir, ".git")); err != nil {
+			logger.Warn().Str("repo", rp.Name).Str("dir", repoDir).Msg("not a git checkout; skipping")
+			continue
+		}
 		if alreadyOpen(in.Task.MergeRequests, rp.Name) {
 			logger.Info().Str("repo", rp.Name).Msg("MR already exists; skipping")
 			continue
 		}
+
+		// any local changes (tracked + untracked)?
+		statCtx, cancelStat := context.WithTimeout(ctx, 30*time.Second)
+		dirty, err := hasChanges(statCtx, repoDir)
+		cancelStat()
+		if err != nil {
+			return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("git status %s: %w", rp.Name, err)
+		}
+		if !dirty {
+			logger.Info().Str("repo", rp.Name).Msg("no local changes; skipping")
+			continue
+		}
+
+		branch := rp.Branch
+		if branch == "" {
+			branch = "ai/" + in.Task.ExternalID
+		}
+
+		// stage everything first so `git diff --cached` covers untracked too
+		if err := runGit(ctx, repoDir, "checkout", "-B", branch, rp.BaseBranch); err != nil {
+			return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("checkout %s %s: %w", rp.Name, branch, err)
+		}
+		// bring files forward onto the new branch
+		// (checkout -B already keeps working tree; nothing to do)
+		if err := runGit(ctx, repoDir, "add", "-A"); err != nil {
+			return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("git add %s: %w", rp.Name, err)
+		}
+		diffCtx, cancelDiff := context.WithTimeout(ctx, 60*time.Second)
+		diff, err := gitDiffCached(diffCtx, repoDir)
+		cancelDiff()
+		if err != nil {
+			return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("git diff --cached %s: %w", rp.Name, err)
+		}
+		if strings.TrimSpace(diff) == "" {
+			logger.Info().Str("repo", rp.Name).Msg("diff empty after staging; skipping")
+			continue
+		}
+
+		// LLM-generated commit + PR text
+		var change llm.ChangeSummary
+		if r.llm != nil {
+			llmCtx, cancelLLM := context.WithTimeout(ctx, 90*time.Second)
+			s, err := r.llm.SummarizeChange(llmCtx, in.Task.ExternalID, in.Task.Title, in.Task.Description, rp.Name, diff)
+			cancelLLM()
+			change = s
+			if err != nil {
+				logger.Warn().Err(err).Str("repo", rp.Name).Msg("LLM summary degraded; using fallback text")
+			}
+		} else {
+			change = llm.ChangeSummary{
+				CommitMessage: fmt.Sprintf("%s %s", in.Task.ExternalID, in.Task.Title),
+				PRTitle:       fmt.Sprintf("%s %s", in.Task.ExternalID, in.Task.Title),
+				PRBody:        fmt.Sprintf("Automated change for %s (%s).", in.Task.ExternalID, rp.Name),
+			}
+		}
+
+		// commit
+		if err := runGit(ctx, repoDir, "commit", "-m", change.CommitMessage); err != nil {
+			return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("git commit %s: %w", rp.Name, err)
+		}
+		// push
+		pushCtx, cancelPush := context.WithTimeout(ctx, 120*time.Second)
+		if err := runGitCtx(pushCtx, repoDir, "push", "-u", "origin", branch); err != nil {
+			cancelPush()
+			return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("git push %s: %w", rp.Name, err)
+		}
+		cancelPush()
+		logger.Info().Str("repo", rp.Name).Str("branch", branch).Msg("branch pushed")
+
+		// open PR
 		boardRepo, ok := findBoardRepo(in.Board, rp.Name)
 		if !ok {
-			logger.Warn().Str("repo", rp.Name).Msg("repo not in board config; skipping")
+			logger.Warn().Str("repo", rp.Name).Msg("repo not in board config; skipping PR open")
 			continue
 		}
 		vcli, err := r.clientFor(boardRepo)
 		if err != nil {
 			return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("vcs client for %s: %w", rp.Name, err)
 		}
-
-		// verify branch exists on origin before trying to open
-		tok := os.Getenv(boardRepo.VCS.Auth.Env)
-		exists, err := git.RemoteBranchExists(ctx, rp.URL, rp.Branch, tok)
-		if err != nil {
-			return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("ls-remote %s: %w", rp.Name, err)
-		}
-		if !exists {
-			msg := fmt.Sprintf("branch %s not found on %s — agent did not push", rp.Branch, rp.Name)
-			logger.Warn().Msg(msg)
-			return stages.ActionResult{Outcome: "failure", Comment: msg}, nil
-		}
-
-		title, body, err := renderMRText(tmpl, in, rp, i)
-		if err != nil {
-			return stages.ActionResult{Outcome: "failure"}, err
-		}
-
 		mr, err := vcli.OpenMR(ctx, vcs.OpenMRRequest{
 			RepoName:     rp.Name,
-			SourceBranch: rp.Branch,
+			SourceBranch: branch,
 			TargetBranch: rp.BaseBranch,
-			Title:        title,
-			Description:  body,
+			Title:        change.PRTitle,
+			Description:  change.PRBody,
 		})
 		if err != nil {
 			return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("open mr %s: %w", rp.Name, err)
 		}
-		logger.Info().Str("repo", rp.Name).Str("url", mr.URL).Msg("MR opened")
+		logger.Info().Str("repo", rp.Name).Str("url", mr.URL).Msg("PR opened")
 		opened = append(opened, mr)
 		newRefs = append(newRefs, tasks.MergeRef{
 			Repo:   rp.Name,
@@ -107,31 +178,18 @@ func (r *OpenMRRunner) Run(ctx context.Context, in stages.ActionInput) (stages.A
 			Number: mr.Number,
 			State:  "open",
 		})
+		fmt.Fprintf(&summary, "- %s: %s\n", rp.Name, mr.URL)
 	}
 
 	if len(opened) == 0 {
-		return stages.ActionResult{Outcome: "success", Comment: "open_mr: nothing to open"}, nil
+		return stages.ActionResult{Outcome: "success", Comment: "open_mr: no changes to commit"}, nil
 	}
-
-	// cross-link if more than one
 	if len(opened) > 1 {
 		r.crosslink(ctx, logger, opened)
 	}
-
-	// ticket comment summarising
-	var comment bytes.Buffer
-	comment.WriteString("Opened merge/pull requests:\n")
-	for _, mr := range opened {
-		comment.WriteString("- ")
-		comment.WriteString(mr.Repo)
-		comment.WriteString(": ")
-		comment.WriteString(mr.URL)
-		comment.WriteString("\n")
-	}
-
 	return stages.ActionResult{
 		Outcome: "success",
-		Comment: comment.String(),
+		Comment: "Opened PRs:\n" + summary.String(),
 		Mutate: func(t *tasks.Task) {
 			t.MergeRequests = append(t.MergeRequests, newRefs...)
 		},
@@ -166,7 +224,6 @@ func (r *OpenMRRunner) crosslink(ctx context.Context, logger zerolog.Logger, mrs
 			}
 			b.WriteByte('\n')
 		}
-		// look up the client by repo name
 		cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		c, ok := r.clients[mrs[i].Repo]
 		if !ok {
@@ -180,42 +237,41 @@ func (r *OpenMRRunner) crosslink(ctx context.Context, logger zerolog.Logger, mrs
 	}
 }
 
-// parseMRTemplate handles an optional Go text/template for the MR body.
-// "" => a sensible default.
-func parseMRTemplate(raw string) (*template.Template, error) {
-	if strings.TrimSpace(raw) == "" {
-		raw = defaultMRTemplate
+// ---- git helpers ----
+
+func hasChanges(ctx context.Context, dir string) (bool, error) {
+	cmd := exec.CommandContext(ctx, "git", "-C", dir, "status", "--porcelain")
+	out, err := cmd.Output()
+	if err != nil {
+		return false, err
 	}
-	return template.New("mr").Parse(raw)
+	return strings.TrimSpace(string(out)) != "", nil
 }
 
-const defaultMRTemplate = `{{.Task.Title}}
-
-Ticket: {{.Task.ExternalID}}{{if .Task.URL}} ({{.Task.URL}}){{end}}
-Repo: {{.Repo.Name}} — branch {{.Repo.Branch}} → {{.Repo.BaseBranch}}
-
-{{if .Task.Description}}{{.Task.Description}}{{end}}
-`
-
-type mrTmplData struct {
-	Task *tasks.Task
-	Repo tasks.RepoState
+func gitDiffCached(ctx context.Context, dir string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "-C", dir, "diff", "--cached", "--no-color")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
 }
 
-func renderMRText(tmpl *template.Template, in stages.ActionInput, rp tasks.RepoState, _ int) (title, body string, err error) {
-	title = in.Task.Title
-	if title == "" {
-		title = in.Task.ExternalID
-	}
-	if in.Task.ExternalID != "" && !strings.Contains(title, in.Task.ExternalID) {
-		title = in.Task.ExternalID + " " + title
-	}
-	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, mrTmplData{Task: in.Task, Repo: rp}); err != nil {
-		return "", "", fmt.Errorf("exec mr template: %w", err)
-	}
-	return title, buf.String(), nil
+func runGit(ctx context.Context, dir string, args ...string) error {
+	return runGitCtx(ctx, dir, args...)
 }
+
+func runGitCtx(ctx context.Context, dir string, args ...string) error {
+	full := append([]string{"-C", dir}, args...)
+	cmd := exec.CommandContext(ctx, "git", full...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git %s: %w (%s)", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// ---- helpers retained from previous impl ----
 
 func findBoardRepo(b config.Board, name string) (config.BoardRepo, bool) {
 	for _, r := range b.Repos {

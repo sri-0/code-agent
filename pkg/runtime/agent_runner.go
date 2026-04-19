@@ -320,6 +320,10 @@ func syncLocalRepos(ctx context.Context, client *opencode.Client, in stages.Acti
 			{"fetch", "--quiet", "origin", branch},
 			{"checkout", "-B", branch, "origin/" + branch},
 			{"reset", "--hard", "origin/" + branch},
+			// wipe untracked files/dirs left over from any prior run so
+			// each stage starts from a truly clean worktree. -f = force,
+			// -d = include directories, -x = include ignored files too.
+			{"clean", "-fdx"},
 		}
 		for _, args := range steps {
 			full := append([]string{"-C", dir}, args...)
