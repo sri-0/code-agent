@@ -25,8 +25,9 @@ stage_sets:
         {{end}}
 
         Make the minimal set of changes across the relevant repositories.
-        Do NOT commit or push; the orchestrator will handle git operations.
-        Do NOT open the merge request; that is also handled outside.
+        When implementation is complete, commit your changes on the branch
+        named in the brief and push with `git push -u origin <branch>`.
+        Do NOT open the merge request; the orchestrator handles that.
 
     - name: test
       provider_status: Testing
@@ -42,6 +43,13 @@ stage_sets:
     - name: ready_for_qa
       provider_status: Ready for QA
       action: open_mr
+      mr_template: |
+        {{.Task.Title}}
+
+        Ticket: {{.Task.ExternalID}}{{if .Task.URL}} ({{.Task.URL}}){{end}}
+        Repo: {{.Repo.Name}} ({{.Repo.Branch}} -> {{.Repo.BaseBranch}})
+
+        {{if .Task.Description}}{{.Task.Description}}{{end}}
       terminal: true
 
     - name: blocked

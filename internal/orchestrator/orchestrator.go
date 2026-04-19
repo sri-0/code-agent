@@ -14,6 +14,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"code-agent/internal/config"
+	"code-agent/pkg/actions"
 	"code-agent/pkg/providers"
 	_ "code-agent/pkg/providers/all" // register providers
 	"code-agent/pkg/runtime"
@@ -21,6 +22,7 @@ import (
 	"code-agent/pkg/stages"
 	"code-agent/pkg/tasks"
 	"code-agent/pkg/transcript"
+	_ "code-agent/pkg/vcs/all" // register vcs providers
 )
 
 type Orchestrator struct {
@@ -70,6 +72,9 @@ func New(cfg *config.Config, logger zerolog.Logger, taskStore tasks.Store, tx tr
 	// Wire the run_agent action runner.
 	o.agentRunner = runtime.NewAgentRunner(o.runtimes, tx)
 	o.engine.Register("run_agent", o.agentRunner)
+
+	// Wire the open_mr action runner (stateless / lazy vcs client cache).
+	o.engine.Register("open_mr", actions.NewOpenMRRunner())
 
 	if cfg.Boards == nil {
 		o.logger.Warn().Msg("no boards configured; orchestrator idle")
