@@ -2,6 +2,9 @@ bin/
 .env
 .env.local
 .workspaces/
+# Per-developer configs — not committed. Copy from config/default/ and
+# point CONFIG_DIR at config/local in .env.
+config/local/
 *.out
 *.test
 .DS_Store

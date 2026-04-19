@@ -1,52 +1,58 @@
-# Minimal stage set for first-time testing.
-#
-# Known gap: the engine currently passes `system_prompt` to opencode
-# verbatim — Go template markers like {{.Repos}} aren't rendered yet.
-# Workaround below: the repo paths are inlined.
-#
-# ClickUp status names are case-sensitive. If your list uses different
-# names (e.g. "Open" instead of "to do", "in progress" capitalised
-# differently, etc.), change `provider_status:` to match exactly — the
-# orchestrator logs `no stage matches status; ignoring` at debug level
-# when they don't line up.
-
 stage_sets:
   default:
     - name: todo
-      # Default ClickUp open status — change if your list differs.
-      provider_status: to do
+      provider_status: To Do
       action: noop
-      next: todo         # stays put until someone moves the card
-      terminal: true
+      next: in_progress
 
     - name: in_progress
-      provider_status: in progress
+      provider_status: In Progress
       action: run_agent
       timeout: 45m
-      # Terminal for the first test: we don't auto-advance to test /
-      # ready_for_qa / open_mr until you've confirmed run_agent works.
-      terminal: true
+      success_next: test
+      failure_next: blocked
       system_prompt: |
-        You are an AI developer working on the Prism codebase. The user
-        has moved a ClickUp ticket into "in progress"; implement what
-        the ticket asks for.
+        You are implementing ticket {{.TicketID}}: {{.Title}}.
 
-        These repositories are available as sibling directories under the
-        current working directory. cd into whichever ones you need:
+        Description:
+        {{.Description}}
 
-        - risky-api-core   (Go API)
-        - risky-live-app   (web app)
-        - accounts-svc     (accounts + billing API)
-        - risky-assess-web (assess API + web app)
-        - risky-live-native (mobile app)
+        Acceptance criteria:
+        {{.AcceptanceCriteria}}
 
-        Rules for this stage:
-        - Read the ticket title + description carefully. Ask clarifying
-          questions only if something is genuinely ambiguous; otherwise
-          proceed.
-        - Make the minimum set of changes needed. Touch only the repos
-          that are actually relevant.
-        - Run tests / type checks in the repos you changed.
-        - Do NOT push or open PRs. That's a later stage.
-        - When done, write a short summary describing which repos you
-          changed and what was tested.
+        The following repositories are checked out:
+        {{range .Repos}}- {{.Name}} at {{.Path}} (branch {{.Branch}})
+        {{end}}
+
+        Make the minimal set of changes across the relevant repositories.
+        When implementation is complete, commit your changes on the branch
+        named in the brief and push with `git push -u origin <branch>`.
+        Do NOT open the merge request; the orchestrator handles that.
+
+    - name: test
+      provider_status: Testing
+      action: run_agent
+      max_retries: 2
+      success_next: ready_for_qa
+      failure_next: in_progress
+      system_prompt: |
+        Run the full test suite across all modified repositories.
+        Fix any failures you caused. When everything passes, write a short
+        summary of what was changed and what was tested.
+
+    - name: ready_for_qa
+      provider_status: Ready for QA
+      action: open_mr
+      mr_template: |
+        {{.Task.Title}}
+
+        Ticket: {{.Task.ExternalID}}{{if .Task.URL}} ({{.Task.URL}}){{end}}
+        Repo: {{.Repo.Name}} ({{.Repo.Branch}} -> {{.Repo.BaseBranch}})
+
+        {{if .Task.Description}}{{.Task.Description}}{{end}}
+      terminal: true
+
+    - name: blocked
+      provider_status: Blocked
+      action: comment_error
+      terminal: true
