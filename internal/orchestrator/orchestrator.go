@@ -16,6 +16,7 @@ import (
 	"code-agent/internal/config"
 	"code-agent/pkg/providers"
 	_ "code-agent/pkg/providers/all" // register providers
+	"code-agent/pkg/stages"
 	"code-agent/pkg/tasks"
 )
 
@@ -24,6 +25,7 @@ type Orchestrator struct {
 	logger zerolog.Logger
 	tasks  tasks.Store
 	disp   *providers.Dispatcher
+	engine *stages.Engine
 
 	// boardByID lets webhook handlers route to the right provider.
 	mu        sync.RWMutex
@@ -36,6 +38,7 @@ func New(cfg *config.Config, logger zerolog.Logger, taskStore tasks.Store) (*Orc
 		logger:    logger.With().Str("component", "orchestrator").Logger(),
 		tasks:     taskStore,
 		disp:      providers.NewDispatcher(256, 5*time.Minute, logger),
+		engine:    stages.NewEngine(cfg, logger, taskStore),
 		boardByID: map[string]providers.BoardProvider{},
 	}
 
@@ -67,6 +70,10 @@ func (o *Orchestrator) Provider(boardID string) (providers.BoardProvider, bool) 
 // Dispatcher exposes the event dispatcher (used by webhook handlers).
 func (o *Orchestrator) Dispatcher() *providers.Dispatcher { return o.disp }
 
+// Engine exposes the stage engine (used by runtime adapters that complete
+// async actions).
+func (o *Orchestrator) Engine() *stages.Engine { return o.engine }
+
 // BoardConfig returns the static board config for the id, if any.
 func (o *Orchestrator) BoardConfig(boardID string) (config.Board, bool) {
 	if o.cfg.Boards == nil {
@@ -94,15 +101,16 @@ func (o *Orchestrator) Start(ctx context.Context) {
 	o.logger.Info().Msg("orchestrator stopped")
 }
 
-// consume reads events and (for now) just logs them. Stage engine wiring
-// lands in Phase 3.
+// consume reads events and dispatches them through the stage engine.
+// We process serially per orchestrator instance for now; sharding by board
+// id is a Phase 6+ concern.
 func (o *Orchestrator) consume(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case e := <-o.disp.Events():
-			o.logger.Info().
+			o.logger.Debug().
 				Str("board", e.BoardID).
 				Str("provider", e.Provider).
 				Str("source", e.Source).
@@ -110,6 +118,22 @@ func (o *Orchestrator) consume(ctx context.Context) {
 				Str("ext_id", e.Ticket.ExternalID).
 				Str("status", e.Ticket.Status).
 				Msg("event")
+
+			b, ok := o.BoardConfig(e.BoardID)
+			if !ok {
+				continue
+			}
+			prov, ok := o.Provider(e.BoardID)
+			if !ok {
+				continue
+			}
+			if o.tasks == nil {
+				o.logger.Warn().Msg("no task store; cannot drive stages")
+				continue
+			}
+			if err := o.engine.HandleEvent(ctx, e, b, prov); err != nil {
+				o.logger.Error().Err(err).Str("ext_id", e.Ticket.ExternalID).Msg("stage handle failed")
+			}
 		}
 	}
 }
