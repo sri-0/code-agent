@@ -44,6 +44,9 @@ type Stage struct {
 	Timeout     time.Duration `yaml:"timeout,omitempty"`
 	MaxRetries  int           `yaml:"max_retries,omitempty"`
 	MRTemplate  string        `yaml:"mr_template,omitempty"` // for action=open_mr
+	// Skills lists bundle names to attach for this stage specifically.
+	// Combined (union) with the board-level skills at dispatch time.
+	Skills []string `yaml:"skills,omitempty"`
 }
 
 func LoadStages(path string) (*StagesConfig, error) {

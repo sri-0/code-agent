@@ -28,6 +28,10 @@ type Board struct {
 	Repos        []BoardRepo   `yaml:"repos"`
 	BranchPrefix string        `yaml:"branch_prefix"`
 	MRStrategy   string        `yaml:"mr_strategy"`
+	// Skills lists bundle names to ship into every stage run on this board.
+	// Bundle names resolve against the host skills dir (CODE_AGENT_SKILLS_DIR).
+	// Per-stage skills are unioned on top of this list.
+	Skills []string `yaml:"skills,omitempty"`
 }
 
 type EnvRef struct {

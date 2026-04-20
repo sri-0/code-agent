@@ -5,8 +5,9 @@
 //     clone each repo into /workspace/<name> with shell `git`. In shared
 //     mode (CODE_AGENT_RUNTIME_MODE=shared) skip upfront cloning — the
 //     orchestrator drives per-session clones via the admin HTTP below.
-//  2. Write /workspace/opencode.json (from CODE_AGENT_OPENCODE_CONFIG, or
-//     a minimal default pointing at /workspace).
+//  2. Write /home/worker/.config/opencode/opencode.json (from
+//     CODE_AGENT_OPENCODE_CONFIG, or a minimal default pointing at
+//     /workspace). Kept outside /workspace so the agent doesn't see it.
 //  3. Start a small admin HTTP on CODE_AGENT_ADMIN_PORT (default 4100):
 //       POST /sessions/{id}/setup {repos:[{name,url,base_branch}]}
 //       DELETE /sessions/{id}
@@ -21,6 +22,8 @@
 package main
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -39,8 +42,13 @@ import (
 )
 
 const (
-	workspaceDir   = "/workspace"
-	opencodeConfig = "/workspace/opencode.json"
+	workspaceDir = "/workspace"
+	// opencode config lives under the worker's HOME, outside /workspace, so
+	// the agent doesn't see it via its file tools. Matches opencode's
+	// standard global config path — set via OPENCODE_CONFIG env below.
+	opencodeHome   = "/home/worker/.config/opencode"
+	opencodeConfig = opencodeHome + "/opencode.json"
+	skillsDir      = opencodeHome + "/skills"
 	defaultPort    = "4096"
 	defaultAdmin   = "4100"
 )
@@ -155,6 +163,7 @@ func startAdminHTTP(port string) *http.Server {
 	})
 	mux.HandleFunc("/sessions/", handleSessions)
 	mux.HandleFunc("/repos/", handleRepos)
+	mux.HandleFunc("/skills", handleSkills)
 
 	srv := &http.Server{Addr: ":" + port, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	ln, err := net.Listen("tcp", srv.Addr)
@@ -357,6 +366,88 @@ func handleRepoCommitPush(w http.ResponseWriter, r *http.Request, dir string) {
 	w.WriteHeader(204)
 }
 
+// ---- skills ----
+//
+// POST /skills — body is a tar archive (optionally gzip-compressed per
+// Content-Encoding: gzip). Entries are extracted into
+// /home/worker/.config/opencode/skills/, preserving the top-level
+// bundle-dir structure (each bundle lives under <name>/SKILL.md + files).
+//
+// Idempotent overwrite per file — the orchestrator re-uploads on every
+// stage, so later writes replace earlier ones. Path traversal (absolute
+// paths, .. segments) is rejected.
+func handleSkills(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", 405)
+		return
+	}
+	defer r.Body.Close()
+	var reader io.Reader = r.Body
+	if strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") {
+		gz, err := gzip.NewReader(r.Body)
+		if err != nil {
+			http.Error(w, "gzip: "+err.Error(), 400)
+			return
+		}
+		defer gz.Close()
+		reader = gz
+	}
+	if err := extractSkillsTar(reader, skillsDir); err != nil {
+		http.Error(w, "extract: "+err.Error(), 500)
+		return
+	}
+	w.WriteHeader(204)
+}
+
+func extractSkillsTar(r io.Reader, dest string) error {
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		return err
+	}
+	tr := tar.NewReader(r)
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		clean := filepath.Clean(h.Name)
+		if clean == "." || clean == "" {
+			continue
+		}
+		if strings.HasPrefix(clean, "..") || strings.HasPrefix(clean, string(filepath.Separator)) {
+			return fmt.Errorf("unsafe path in tar: %s", h.Name)
+		}
+		target := filepath.Join(dest, clean)
+		switch h.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(f, tr); err != nil {
+				_ = f.Close()
+				return err
+			}
+			if err := f.Close(); err != nil {
+				return err
+			}
+		default:
+			// Silently skip symlinks, devices, etc. Skill bundles should be
+			// plain files + dirs only.
+		}
+	}
+	return nil
+}
+
 func runGit(dir string, args ...string) error {
 	full := append([]string{"-C", dir}, args...)
 	cmd := exec.Command("git", full...)
@@ -445,25 +536,23 @@ func urlWithToken(raw, token string) (string, bool) {
 	return u.String(), true
 }
 
-func writeOpenCodeConfig(repos []repo, eager bool) error {
+func writeOpenCodeConfig(_ []repo, _ bool) error {
+	if err := os.MkdirAll(opencodeHome, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", opencodeHome, err)
+	}
 	if raw := os.Getenv("CODE_AGENT_OPENCODE_CONFIG"); raw != "" {
 		if !json.Valid([]byte(raw)) {
 			return fmt.Errorf("CODE_AGENT_OPENCODE_CONFIG is not valid JSON")
 		}
 		return os.WriteFile(opencodeConfig, []byte(raw), 0o644)
 	}
-	allowed := []string{workspaceDir}
-	if eager {
-		for _, r := range repos {
-			allowed = append(allowed, filepath.Join(workspaceDir, r.Name))
-		}
-	}
+	// No override → ship a minimal config with just the schema marker.
+	// Filesystem scoping lives under `permission` in current opencode; the
+	// old `folders` stanza was removed and now errors the server. Callers
+	// that need provider keys or permission tuning should inject via
+	// CODE_AGENT_OPENCODE_CONFIG.
 	cfg := map[string]any{
 		"$schema": "https://opencode.ai/config.json",
-		"folders": map[string]any{
-			"allowed": allowed,
-			"denied":  []string{workspaceDir + "/.git/hooks"},
-		},
 	}
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {

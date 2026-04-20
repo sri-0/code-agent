@@ -11,6 +11,9 @@ stage_sets:
       timeout: 45m
       success_next: test
       failure_next: blocked
+      # Skill bundles to attach for this stage only (unioned with board skills).
+      # skills:
+      #   - ts-strict
       system_prompt: |
         You are implementing ticket {{.TicketID}}: {{.Title}}.
 

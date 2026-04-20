@@ -76,7 +76,7 @@ func New(cfg *config.Config, logger zerolog.Logger, taskStore tasks.Store, tx tr
 	}
 
 	// Wire the run_agent action runner.
-	o.agentRunner = runtime.NewAgentRunner(o.runtimes, tx)
+	o.agentRunner = runtime.NewAgentRunner(o.runtimes, tx, cfg.Skills)
 	o.engine.Register("run_agent", o.agentRunner)
 
 	// Wire the open_mr action runner (stateless / lazy vcs client cache).

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"code-agent/internal/config"
 	"code-agent/pkg/opencode"
 	"code-agent/pkg/stages"
 	"code-agent/pkg/tasks"
@@ -30,14 +31,16 @@ import (
 type AgentRunner struct {
 	runtimes map[string]Runtime // runtime config name -> instance
 	tx       transcript.Store
+	skills   *config.SkillsIndex // host-side skill bundle index (may be nil)
 
 	// streamWG tracks transcript writers so server shutdown can drain them.
 	streamWG sync.WaitGroup
 }
 
-// NewAgentRunner constructs the action runner.
-func NewAgentRunner(runtimes map[string]Runtime, tx transcript.Store) *AgentRunner {
-	return &AgentRunner{runtimes: runtimes, tx: tx}
+// NewAgentRunner constructs the action runner. skills may be nil when
+// the orchestrator has no CODE_AGENT_SKILLS_DIR configured.
+func NewAgentRunner(runtimes map[string]Runtime, tx transcript.Store, skills *config.SkillsIndex) *AgentRunner {
+	return &AgentRunner{runtimes: runtimes, tx: tx, skills: skills}
 }
 
 // Wait blocks until any in-flight streams finish.
@@ -68,6 +71,13 @@ func (r *AgentRunner) Run(ctx context.Context, in stages.ActionInput) (stages.Ac
 	}
 	in.Task.WorkerRef = *ref
 	in.Task.RuntimeMode = rt.Mode()
+
+	// Ship skill bundles (union of board.skills + stage.skills) to the
+	// worker before the first prompt of this stage. Non-fatal on error —
+	// the agent can still run, just without the skill hints.
+	if err := r.syncSkills(ctx, in, ref); err != nil {
+		in.Logger.Warn().Err(err).Msg("skill sync failed; continuing without skills")
+	}
 
 	// For local runtime: sync each repo to its configured base_branch
 	// before handing off to the agent. We fetch, hard-reset, and check out
@@ -164,6 +174,48 @@ func (r *AgentRunner) Run(ctx context.Context, in stages.ActionInput) (stages.Ac
 			t.RuntimeMode = rt.Mode()
 		},
 	}, nil
+}
+
+// syncSkills resolves the union of board-level and stage-level skill
+// names against the host skills index and uploads matching bundles to
+// the worker's admin HTTP. No-op when no skills are requested or when
+// the runtime has no admin URL (e.g. local mode — dev manages their own
+// ~/.config/opencode/skills).
+func (r *AgentRunner) syncSkills(ctx context.Context, in stages.ActionInput, ref *tasks.WorkerRef) error {
+	names := unionSkills(in.Board.Skills, in.Stage.Skills)
+	if len(names) == 0 {
+		return nil
+	}
+	dirs, err := r.skills.Resolve(names)
+	if err != nil {
+		return err
+	}
+	if ref.AdminURL == "" {
+		in.Logger.Debug().Strs("skills", names).Msg("no admin URL; skipping skill upload (local mode)")
+		return nil
+	}
+	uploadCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := UploadSkills(uploadCtx, ref.AdminURL, dirs); err != nil {
+		return err
+	}
+	in.Logger.Info().Strs("skills", names).Int("bundles", len(dirs)).Msg("skills synced to worker")
+	return nil
+}
+
+func unionSkills(a, b []string) []string {
+	seen := map[string]struct{}{}
+	var out []string
+	for _, list := range [][]string{a, b} {
+		for _, s := range list {
+			if _, ok := seen[s]; ok {
+				continue
+			}
+			seen[s] = struct{}{}
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // formatPlanDescription builds the new ticket description: an "Agent plan"

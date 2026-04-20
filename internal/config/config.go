@@ -34,11 +34,18 @@ type Config struct {
 	OpenCodeURL      string `env:"OPENCODE_URL,default=http://localhost:4096"`
 	OpenCodePassword string `env:"OPENCODE_SERVER_PASSWORD"`
 
+	// SkillsDir points at the host directory holding Anthropic-style skill
+	// bundles (each a subdir with SKILL.md + supporting files). Bundle
+	// names referenced from boards.yaml / stages.yaml resolve here. Empty
+	// disables skills.
+	SkillsDir string `env:"CODE_AGENT_SKILLS_DIR"`
+
 	// Attached after YAML load. No env tag — envconfig leaves them alone.
 	Boards   *BoardsConfig
 	Stages   *StagesConfig
 	Runtimes *RuntimesConfig
 	OpenCode OpenCodeConfig
+	Skills   *SkillsIndex
 }
 
 // Load reads env vars; call LoadYAML afterwards to populate the YAML fields.
@@ -77,6 +84,12 @@ func LoadYAML(cfg *Config) error {
 		return fmt.Errorf("opencode.yaml: %w", err)
 	} else {
 		cfg.OpenCode = o
+	}
+
+	if sk, err := LoadSkills(cfg.SkillsDir); err != nil {
+		return fmt.Errorf("skills: %w", err)
+	} else {
+		cfg.Skills = sk
 	}
 
 	return nil

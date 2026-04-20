@@ -39,3 +39,9 @@ boards:
             env: GITHUB_BOT_TOKEN
     branch_prefix: ai/
     mr_strategy: per_repo_cross_linked
+    # Skill bundle names (folders under $CODE_AGENT_SKILLS_DIR on the host)
+    # attached for every stage run on this board. Per-stage `skills:` lists
+    # are unioned on top.
+    # skills:
+    #   - pr-conventions
+    #   - go-review
