@@ -101,7 +101,10 @@ func (r *OpenMRRunner) Run(ctx context.Context, in stages.ActionInput) (stages.A
 		dirty, diff, err := driver.getStatusAndDiff(statCtx, rp.Name)
 		cancelStat()
 		if err != nil {
-			return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("status %s: %w", rp.Name, err)
+			return stages.ActionResult{
+				Outcome: "failure",
+				Comment: openMRFailureComment(in, rp.Name, "git status/diff failed: "+err.Error()),
+			}, fmt.Errorf("status %s: %w", rp.Name, err)
 		}
 		if !dirty || strings.TrimSpace(diff) == "" {
 			logger.Info().Str("repo", rp.Name).Msg("no local changes; skipping")
@@ -130,7 +133,10 @@ func (r *OpenMRRunner) Run(ctx context.Context, in stages.ActionInput) (stages.A
 		pushCtx, cancelPush := context.WithTimeout(ctx, 180*time.Second)
 		if err := driver.commitAndPush(pushCtx, rp.Name, branch, rp.BaseBranch, change.CommitMessage); err != nil {
 			cancelPush()
-			return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("commit/push %s: %w", rp.Name, err)
+			return stages.ActionResult{
+				Outcome: "failure",
+				Comment: openMRFailureComment(in, rp.Name, "commit/push to "+branch+" failed: "+err.Error()),
+			}, fmt.Errorf("commit/push %s: %w", rp.Name, err)
 		}
 		cancelPush()
 		logger.Info().Str("repo", rp.Name).Str("branch", branch).Msg("branch pushed")
@@ -153,7 +159,10 @@ func (r *OpenMRRunner) Run(ctx context.Context, in stages.ActionInput) (stages.A
 			Description:  change.PRBody,
 		})
 		if err != nil {
-			return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("open mr %s: %w", rp.Name, err)
+			return stages.ActionResult{
+				Outcome: "failure",
+				Comment: openMRFailureComment(in, rp.Name, "PR open failed: "+err.Error()),
+			}, fmt.Errorf("open mr %s: %w", rp.Name, err)
 		}
 		logger.Info().Str("repo", rp.Name).Str("url", mr.URL).Msg("PR opened")
 		opened = append(opened, mr)
@@ -194,6 +203,10 @@ func (r *OpenMRRunner) clientFor(repo config.BoardRepo) (vcs.Client, error) {
 	}
 	r.clients[repo.Name] = c
 	return c, nil
+}
+
+func openMRFailureComment(in stages.ActionInput, repoName, reason string) string {
+	return "🤖 code-agent: stage `" + in.Stage.Name + "` failed for " + in.Task.ExternalID + " on repo `" + repoName + "`. " + reason
 }
 
 func (r *OpenMRRunner) crosslink(ctx context.Context, logger zerolog.Logger, mrs []vcs.MergeRequest) {

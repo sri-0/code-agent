@@ -133,10 +133,11 @@ func (c *Client) CreateSession(ctx context.Context, title string) (*Session, err
 	return &s, nil
 }
 
-// PostMessage sends a user message in a session and blocks until the model
-// finishes. Prefer PostMessageAsync for non-trivial work — /message holds
-// the HTTP connection open for the full model turn (potentially many
-// minutes) and hits timeouts.
+// PostMessage appends a user message to a session without executing it.
+// Despite the "message" name this is fire-and-forget from opencode 1.14 —
+// it returns ~immediately while any running turn continues in the
+// background, and it does NOT kick off a new model turn on its own.
+// Callers that want the model to respond should use PostMessageAsync.
 func (c *Client) PostMessage(ctx context.Context, sessionID string, req PostMessageRequest) error {
 	if sessionID == "" {
 		return fmt.Errorf("sessionID required")
@@ -148,8 +149,9 @@ func (c *Client) PostMessage(ctx context.Context, sessionID string, req PostMess
 }
 
 // PostMessageAsync submits a prompt and returns as soon as opencode has
-// queued it. Completion is observed via the SSE /event stream — watch for
-// message.completed / session.idle / session.error.
+// queued it. Completion is observed by polling GET /session/{id}/message
+// (via WaitForTurn) — SSE terminal events are unreliable on provider
+// errors.
 func (c *Client) PostMessageAsync(ctx context.Context, sessionID string, req PostMessageRequest) error {
 	if sessionID == "" {
 		return fmt.Errorf("sessionID required")
@@ -173,10 +175,34 @@ type SessionMessage struct {
 }
 
 type SessionMessageInfo struct {
-	ID         string `json:"id"`
-	Role       string `json:"role"` // "user" | "assistant"
-	ProviderID string `json:"providerID"`
-	ModelID    string `json:"modelID"`
+	ID         string           `json:"id"`
+	Role       string           `json:"role"` // "user" | "assistant"
+	ProviderID string           `json:"providerID"`
+	ModelID    string           `json:"modelID"`
+	Time       MessageTimeInfo  `json:"time"`
+	Error      *MessageErrorBox `json:"error,omitempty"`
+}
+
+// MessageTimeInfo is the message lifecycle timestamps opencode attaches to
+// every message. `completed` is only set once the full turn is done
+// (including any tool calls + subagents the assistant fires off). Zero
+// means the turn is still in flight.
+type MessageTimeInfo struct {
+	Created   int64 `json:"created"`
+	Completed int64 `json:"completed"`
+}
+
+// MessageErrorBox is opencode's error shape on assistant messages when the
+// provider call fails (credit limit, rate limit, auth, 5xx, etc.). The
+// inner Data.Message is what we surface to the user.
+type MessageErrorBox struct {
+	Name string           `json:"name"`
+	Data MessageErrorData `json:"data"`
+}
+
+type MessageErrorData struct {
+	Message    string `json:"message"`
+	StatusCode int    `json:"statusCode,omitempty"`
 }
 
 // Messages returns the full message history for a session. Ordered oldest
@@ -212,4 +238,86 @@ func (c *Client) LastAssistantText(ctx context.Context, sessionID string) (strin
 		return b.String(), nil
 	}
 	return "", nil
+}
+
+// TurnResult summarises the outcome of a single prompt turn as observed
+// from opencode's message history.
+type TurnResult struct {
+	// Message is the final assistant message (the one whose time.completed
+	// first becomes non-zero after we submitted the prompt).
+	Message SessionMessage
+	// Text is the concatenated text parts of the final assistant message.
+	Text string
+	// Error, if non-nil, is the provider error opencode recorded on the
+	// message (credit limit, rate limit, auth, etc.). Turn is still
+	// "completed" from opencode's POV, but the caller should treat it
+	// as a failure and surface the reason.
+	Error *MessageErrorBox
+	// ToolCalls is the number of tool-use parts observed in the final
+	// assistant message. Zero indicates the model never executed any
+	// tools this turn — often a symptom of a silent failure.
+	ToolCalls int
+}
+
+// WaitForTurn polls GET /session/{id}/message until the tail assistant
+// message's time.completed becomes non-zero, or ctx is cancelled. `after`
+// is the Unix-ms cutoff: we only consider assistant messages created at
+// or after this time so a stale completed message from a prior turn
+// can't short-circuit the wait.
+//
+// We poll instead of relying on SSE terminal events because opencode
+// does not always emit session.idle / session.error on provider failures
+// (observed with 402/credit errors — the server logs the error, sets
+// time.completed, and never fires an SSE terminal).
+func (c *Client) WaitForTurn(ctx context.Context, sessionID string, after int64) (*TurnResult, error) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		res, err := c.checkTurn(ctx, sessionID, after)
+		if err != nil {
+			return nil, err
+		}
+		if res != nil {
+			return res, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (c *Client) checkTurn(ctx context.Context, sessionID string, after int64) (*TurnResult, error) {
+	msgs, err := c.Messages(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		m := msgs[i]
+		if m.Info.Role != "assistant" {
+			continue
+		}
+		if m.Info.Time.Created < after {
+			// Older assistant message from a prior prompt; earlier messages
+			// are only older, so stop scanning.
+			return nil, nil
+		}
+		if m.Info.Time.Completed == 0 {
+			return nil, nil
+		}
+		res := &TurnResult{Message: m, Error: m.Info.Error}
+		var b strings.Builder
+		for _, p := range m.Parts {
+			if p.Type == "text" {
+				b.WriteString(p.Text)
+			}
+			if p.Type == "tool" {
+				res.ToolCalls++
+			}
+		}
+		res.Text = b.String()
+		return res, nil
+	}
+	return nil, nil
 }

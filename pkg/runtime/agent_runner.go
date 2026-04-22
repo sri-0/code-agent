@@ -98,47 +98,103 @@ func (r *AgentRunner) Run(ctx context.Context, in stages.ActionInput) (stages.Ac
 	}
 	in.Task.SessionID = sessionID
 
-	// Start SSE streaming for the transcript in the background. We no
-	// longer rely on SSE events for completion detection — the sync
-	// PostMessage below blocks until the full turn (including all tool
-	// calls and subagent work) is done. SSE is just for observability.
+	// Start SSE streaming for the transcript. Purely observability —
+	// completion detection is driven by polling GET /session/{id}/message
+	// below. SSE terminal events (session.idle/error) are unreliable on
+	// provider failures: opencode records the error on the assistant
+	// message's time.completed/error fields but does NOT always emit a
+	// session.error SSE. We rely on the message record instead.
 	streamCtx, streamCancel := context.WithCancel(context.Background())
+	defer streamCancel()
 	events, errs, err := client.Stream(streamCtx)
 	if err != nil {
-		streamCancel()
 		return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("stream: %w", err)
 	}
 	r.streamWG.Add(1)
 	go r.consumeStream(streamCtx, sessionID, events, errs, nil, in)
 
-	// Compose user message and submit synchronously. PostMessage blocks
-	// until opencode is finished with this prompt. Bounded by the action
-	// ctx (stage.Timeout, ~45m). Abort on ctx cancellation.
+	// Submit prompt async + poll for completion. /prompt_async returns
+	// immediately once opencode has queued the turn; we then block on
+	// WaitForTurn until the tail assistant message has time.completed
+	// set, bounded by the stage ctx (stage.Timeout, e.g. 45m-90m).
 	userMsg := composeUserMessage(in.Task)
-	err = client.PostMessage(ctx, sessionID, opencode.PostMessageRequest{
+	submitStart := time.Now().UnixMilli()
+	if err := client.PostMessageAsync(ctx, sessionID, opencode.PostMessageRequest{
 		ProviderID: in.Stage.Provider,
 		ModelID:    in.Stage.Model,
 		Agent:      in.Stage.Agent,
 		System:     in.Stage.SystemPrompt,
 		Parts:      []opencode.MessagePart{{Type: "text", Text: userMsg}},
-	})
-	streamCancel()
-	if err != nil {
+	}); err != nil {
 		if ctx.Err() != nil {
 			abortCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			_ = client.AbortSession(abortCtx, sessionID)
 			cancel()
 			return stages.ActionResult{Outcome: "failure"}, ctx.Err()
 		}
-		return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("post message: %w", err)
+		return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("post prompt: %w", err)
 	}
 
-	// PostMessage returned cleanly → the turn is fully done. Inspect the
-	// last assistant message for sentinel markers (NEEDS_MORE_INFO /
-	// PLAN_START..PLAN_END).
-	fetchCtx, cancelFetch := context.WithTimeout(context.Background(), 15*time.Second)
-	lastText, _ := client.LastAssistantText(fetchCtx, sessionID)
-	cancelFetch()
+	turn, err := client.WaitForTurn(ctx, sessionID, submitStart)
+	if err != nil {
+		if ctx.Err() != nil {
+			abortCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = client.AbortSession(abortCtx, sessionID)
+			cancel()
+			return stages.ActionResult{
+				Outcome: "failure",
+				Comment: r.ticketComment(in, "agent turn timed out ("+in.Stage.Timeout.String()+"); session aborted"),
+				Mutate: func(t *tasks.Task) {
+					t.SessionID = sessionID
+					t.WorkerRef = *ref
+					t.RuntimeMode = rt.Mode()
+				},
+			}, ctx.Err()
+		}
+		return stages.ActionResult{Outcome: "failure"}, fmt.Errorf("wait for turn: %w", err)
+	}
+
+	// Provider error recorded on the assistant message (credit limit, rate
+	// limit, auth, etc). opencode doesn't emit a terminal SSE event on
+	// these — the error lives on the message.
+	if turn.Error != nil {
+		reason := turn.Error.Data.Message
+		if reason == "" {
+			reason = turn.Error.Name
+		}
+		in.Logger.Error().
+			Str("error_name", turn.Error.Name).
+			Int("status_code", turn.Error.Data.StatusCode).
+			Str("reason", reason).
+			Msg("agent turn failed: provider error")
+		return stages.ActionResult{
+			Outcome: "failure",
+			Comment: r.ticketComment(in, "agent turn failed ("+turn.Error.Name+"): "+reason),
+			Mutate: func(t *tasks.Task) {
+				t.SessionID = sessionID
+				t.WorkerRef = *ref
+				t.RuntimeMode = rt.Mode()
+			},
+		}, nil
+	}
+
+	// Empty turn guard: the model produced neither text nor any tool
+	// calls. Treat as a silent failure — advancing to open_mr would open
+	// an empty PR.
+	if strings.TrimSpace(turn.Text) == "" && turn.ToolCalls == 0 {
+		in.Logger.Error().Msg("agent turn produced no output (no text, no tool calls); treating as failure")
+		return stages.ActionResult{
+			Outcome: "failure",
+			Comment: r.ticketComment(in, "agent turn finished with no output (no text, no tool calls) — likely a silent provider or permission error; check the opencode worker logs"),
+			Mutate: func(t *tasks.Task) {
+				t.SessionID = sessionID
+				t.WorkerRef = *ref
+				t.RuntimeMode = rt.Mode()
+			},
+		}, nil
+	}
+
+	lastText := turn.Text
 
 	if reason, ok := parseNeedsMoreInfo(lastText); ok {
 		in.Logger.Warn().Str("reason", reason).Msg("agent reported needs-more-info; tagging ticket")
@@ -166,6 +222,10 @@ func (r *AgentRunner) Run(ctx context.Context, in stages.ActionInput) (stages.Ac
 		}
 		cancelDesc()
 	}
+	in.Logger.Info().
+		Int("text_bytes", len(lastText)).
+		Int("tool_calls", turn.ToolCalls).
+		Msg("agent turn completed")
 	return stages.ActionResult{
 		Outcome: "success",
 		Mutate: func(t *tasks.Task) {
@@ -174,6 +234,13 @@ func (r *AgentRunner) Run(ctx context.Context, in stages.ActionInput) (stages.Ac
 			t.RuntimeMode = rt.Mode()
 		},
 	}, nil
+}
+
+// ticketComment renders a diagnostic comment suitable for posting back to
+// the board ticket. Kept short but specific — includes stage + ticket id
+// so operators viewing the ticket know exactly what step failed.
+func (r *AgentRunner) ticketComment(in stages.ActionInput, reason string) string {
+	return "🤖 code-agent: stage `" + in.Stage.Name + "` failed for " + in.Task.ExternalID + ". " + reason
 }
 
 // syncSkills resolves the union of board-level and stage-level skill

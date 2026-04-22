@@ -286,6 +286,10 @@ func baseEnv(password string, t *tasks.Task, b config.Board, mode string) map[st
 	if len(t.Repos) > 0 {
 		env["CODE_AGENT_REPOS"] = reposCSV(t.Repos)
 	}
+	// Lets cmd/runner resume an ai/<ticket> branch from a prior run.
+	if b.BranchPrefix != "" {
+		env["CODE_AGENT_BRANCH_PREFIX"] = b.BranchPrefix
+	}
 	// Per-repo git auth: cmd/runner looks for CODE_AGENT_GIT_TOKEN_<NAME>
 	// (uppercase, dashes -> underscores) and injects the token as HTTP
 	// basic auth in the clone URL. The orchestrator reads the token's

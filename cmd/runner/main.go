@@ -84,6 +84,8 @@ func main() {
 	if err != nil {
 		fatalf("parse CODE_AGENT_REPOS: %v", err)
 	}
+	extID := os.Getenv("CODE_AGENT_EXTERNAL_ID")
+	branchPrefix := envDefault("CODE_AGENT_BRANCH_PREFIX", "ai/")
 	if eager {
 		for _, r := range repos {
 			dest := filepath.Join(workspaceDir, r.Name)
@@ -93,6 +95,14 @@ func main() {
 			}
 			if err := cloneRepo(r, dest); err != nil {
 				fatalf("clone %s: %v", r.Name, err)
+			}
+			// After cloning the base branch, see whether an ai/<ticket>
+			// branch already exists on the remote from a prior agent run.
+			// If so, check it out so the agent sees prior work on disk
+			// (and its new commits extend that branch rather than forking
+			// a duplicate from base).
+			if extID != "" && branchPrefix != "" {
+				resumeAgentBranch(dest, r.Name, branchPrefix+extID)
 			}
 		}
 	}
@@ -522,6 +532,30 @@ func cloneRepo(r repo, dest string) error {
 	}
 	logf("cloned %s@%s in %s", r.Name, r.BaseBranch, time.Since(start).Truncate(time.Millisecond))
 	return nil
+}
+
+// resumeAgentBranch checks whether the given branch exists on origin and,
+// if it does, fetches + checks it out so prior agent work is on disk.
+// All failures are warnings (not fatal) — the repo is usable from the
+// base branch regardless, and we'd rather degrade than crash the pod.
+func resumeAgentBranch(dest, repoName, branch string) {
+	out, err := exec.Command("git", "-C", dest, "ls-remote", "--heads", "origin", branch).Output()
+	if err != nil {
+		logf("warn: ls-remote %s in %s: %v", branch, repoName, err)
+		return
+	}
+	if strings.TrimSpace(string(out)) == "" {
+		return // no prior agent branch
+	}
+	if err := runGit(dest, "fetch", "origin", branch); err != nil {
+		logf("warn: fetch %s in %s: %v", branch, repoName, err)
+		return
+	}
+	if err := runGit(dest, "checkout", "-B", branch, "origin/"+branch); err != nil {
+		logf("warn: checkout %s in %s: %v", branch, repoName, err)
+		return
+	}
+	logf("resumed prior agent branch %s in %s", branch, repoName)
 }
 
 func urlWithToken(raw, token string) (string, bool) {
