@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"time"
 
 	"code-agent/pkg/db/valkey"
 
@@ -39,6 +40,17 @@ type Config struct {
 	// names referenced from boards.yaml / stages.yaml resolve here. Empty
 	// disables skills.
 	SkillsDir string `env:"CODE_AGENT_SKILLS_DIR"`
+
+	// PodTTLAfterMRClosed is how long persistent worker pods are kept
+	// alive after all of a task's MRs have been closed/merged. Lets
+	// humans revisit the opencode UI after the work is "done".
+	PodTTLAfterMRClosed time.Duration `env:"CODE_AGENT_POD_TTL_AFTER_MR_CLOSED,default=24h"`
+	// PodTTLMax is the absolute upper bound on a pod's lifetime,
+	// regardless of MR state. Catches runaway / forgotten pods.
+	PodTTLMax time.Duration `env:"CODE_AGENT_POD_TTL_MAX,default=168h"`
+	// PodGCInterval is how often the persistent-runtime GC goroutine
+	// scans live pods. Must be smaller than the TTLs to be useful.
+	PodGCInterval time.Duration `env:"CODE_AGENT_POD_GC_INTERVAL,default=10m"`
 
 	// Attached after YAML load. No env tag — envconfig leaves them alone.
 	Boards   *BoardsConfig

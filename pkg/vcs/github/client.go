@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	gh "github.com/google/go-github/v67/github"
 
@@ -20,6 +23,10 @@ type client struct {
 	owner string
 	repo  string
 	host  string
+
+	botOnce sync.Once
+	botID   string
+	botErr  error
 }
 
 func (c *client) Provider() string { return "github" }
@@ -40,13 +47,7 @@ func (c *client) OpenMR(ctx context.Context, in vcs.OpenMRRequest) (vcs.MergeReq
 	if err != nil {
 		return vcs.MergeRequest{}, fmt.Errorf("create pr: %w", err)
 	}
-	return vcs.MergeRequest{
-		Repo:   in.RepoName,
-		Number: pr.GetNumber(),
-		URL:    pr.GetHTMLURL(),
-		State:  pr.GetState(),
-		Title:  pr.GetTitle(),
-	}, nil
+	return mrFromPR(in.RepoName, pr), nil
 }
 
 func (c *client) GetMR(ctx context.Context, ref vcs.MergeRequest) (vcs.MergeRequest, error) {
@@ -54,13 +55,7 @@ func (c *client) GetMR(ctx context.Context, ref vcs.MergeRequest) (vcs.MergeRequ
 	if err != nil {
 		return vcs.MergeRequest{}, fmt.Errorf("get pr: %w", err)
 	}
-	return vcs.MergeRequest{
-		Repo:   ref.Repo,
-		Number: pr.GetNumber(),
-		URL:    pr.GetHTMLURL(),
-		State:  pr.GetState(),
-		Title:  pr.GetTitle(),
-	}, nil
+	return mrFromPR(ref.Repo, pr), nil
 }
 
 func (c *client) Comment(ctx context.Context, ref vcs.MergeRequest, body string) error {
@@ -71,6 +66,98 @@ func (c *client) Comment(ctx context.Context, ref vcs.MergeRequest, body string)
 		return fmt.Errorf("create issue comment: %w", err)
 	}
 	return nil
+}
+
+// ListComments returns issue comments on the PR. We don't include the
+// file-level "review" comments (PullRequestsService.ListComments) for
+// now — reviewers typically use the main thread for "please change X"
+// and code-level comments are harder to respond to cleanly.
+func (c *client) ListComments(ctx context.Context, ref vcs.MergeRequest, since time.Time) ([]vcs.ReviewComment, error) {
+	opts := &gh.IssueListCommentsOptions{
+		Sort:      gh.String("created"),
+		Direction: gh.String("asc"),
+		ListOptions: gh.ListOptions{PerPage: 100},
+	}
+	if !since.IsZero() {
+		s := since
+		opts.Since = &s
+	}
+	var out []vcs.ReviewComment
+	for {
+		comments, resp, err := c.c.Issues.ListComments(ctx, c.owner, c.repo, ref.Number, opts)
+		if err != nil {
+			return nil, fmt.Errorf("list issue comments: %w", err)
+		}
+		for _, com := range comments {
+			created := com.GetCreatedAt().Time
+			if !since.IsZero() && !created.After(since) {
+				continue
+			}
+			out = append(out, vcs.ReviewComment{
+				ID:        strconv.FormatInt(com.GetID(), 10),
+				Author:    com.GetUser().GetLogin(),
+				Body:      com.GetBody(),
+				CreatedAt: created,
+				URL:       com.GetHTMLURL(),
+			})
+		}
+		if resp == nil || resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return out, nil
+}
+
+// ReplyToComment posts a top-level issue comment that quotes the parent's
+// first line. GitHub issue comments are flat — there's no native threading
+// for PR conversation (code-review comments support threading, but this
+// client only deals with issue comments).
+func (c *client) ReplyToComment(ctx context.Context, ref vcs.MergeRequest, parent vcs.ReviewComment, body string) error {
+	var b strings.Builder
+	if parent.Author != "" && parent.Body != "" {
+		first := strings.TrimSpace(strings.SplitN(parent.Body, "\n", 2)[0])
+		if len(first) > 160 {
+			first = first[:157] + "…"
+		}
+		fmt.Fprintf(&b, "> @%s: %s\n\n", parent.Author, first)
+	}
+	b.WriteString(body)
+	return c.Comment(ctx, ref, b.String())
+}
+
+func (c *client) BotIdentity(ctx context.Context) (string, error) {
+	c.botOnce.Do(func() {
+		u, _, err := c.c.Users.Get(ctx, "")
+		if err != nil {
+			c.botErr = fmt.Errorf("github get authenticated user: %w", err)
+			return
+		}
+		c.botID = u.GetLogin()
+	})
+	return c.botID, c.botErr
+}
+
+func mrFromPR(repoName string, pr *gh.PullRequest) vcs.MergeRequest {
+	mr := vcs.MergeRequest{
+		Repo:         repoName,
+		Number:       pr.GetNumber(),
+		URL:          pr.GetHTMLURL(),
+		State:        pr.GetState(),
+		Title:        pr.GetTitle(),
+		SourceBranch: pr.GetHead().GetRef(),
+		TargetBranch: pr.GetBase().GetRef(),
+	}
+	if pr.GetMerged() {
+		mr.State = "merged"
+	}
+	if t := pr.GetClosedAt().Time; !t.IsZero() {
+		mr.ClosedAt = &t
+	}
+	if t := pr.GetMergedAt().Time; !t.IsZero() {
+		mr.MergedAt = &t
+	}
+	return mr
 }
 
 // parseOwnerRepo extracts "owner", "repo" from a clone URL.

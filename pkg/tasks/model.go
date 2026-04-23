@@ -70,9 +70,19 @@ type RepoState struct {
 }
 
 type MergeRef struct {
-	Repo   string `json:"repo"`
-	URL    string `json:"url"`
-	IID    int    `json:"iid,omitempty"`    // gitlab
-	Number int    `json:"number,omitempty"` // github
-	State  string `json:"state"`            // open | merged | closed
+	Repo         string `json:"repo"`
+	URL          string `json:"url"`
+	IID          int    `json:"iid,omitempty"`    // gitlab
+	Number       int    `json:"number,omitempty"` // github
+	State        string `json:"state"`            // open | merged | closed
+	SourceBranch string `json:"source_branch,omitempty"`
+	TargetBranch string `json:"target_branch,omitempty"`
+	// ClosedAt/MergedAt are populated by the pod-TTL GC scan so it can
+	// age pods off N hours after close. Nil until a terminal state.
+	ClosedAt *time.Time `json:"closed_at,omitempty"`
+	MergedAt *time.Time `json:"merged_at,omitempty"`
+	// LastCommentCursor is the CreatedAt of the newest comment the
+	// review-feedback poller has processed on this MR. Used to page
+	// forward without re-processing.
+	LastCommentCursor time.Time `json:"last_comment_cursor,omitempty"`
 }

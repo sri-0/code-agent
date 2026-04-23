@@ -12,7 +12,10 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	glab "github.com/xanzy/go-gitlab"
 
@@ -24,6 +27,10 @@ type client struct {
 	c           *glab.Client
 	projectPath string // "group/sub/project"
 	host        string
+
+	botOnce sync.Once
+	botID   string
+	botErr  error
 }
 
 func (c *client) Provider() string { return "gitlab" }
@@ -39,13 +46,7 @@ func (c *client) OpenMR(ctx context.Context, in vcs.OpenMRRequest) (vcs.MergeReq
 	if err != nil {
 		return vcs.MergeRequest{}, fmt.Errorf("create mr: %w", err)
 	}
-	return vcs.MergeRequest{
-		Repo:  in.RepoName,
-		IID:   mr.IID,
-		URL:   mr.WebURL,
-		State: mr.State,
-		Title: mr.Title,
-	}, nil
+	return mrFromGitlab(in.RepoName, mr), nil
 }
 
 func (c *client) GetMR(ctx context.Context, ref vcs.MergeRequest) (vcs.MergeRequest, error) {
@@ -53,13 +54,7 @@ func (c *client) GetMR(ctx context.Context, ref vcs.MergeRequest) (vcs.MergeRequ
 	if err != nil {
 		return vcs.MergeRequest{}, fmt.Errorf("get mr: %w", err)
 	}
-	return vcs.MergeRequest{
-		Repo:  ref.Repo,
-		IID:   mr.IID,
-		URL:   mr.WebURL,
-		State: mr.State,
-		Title: mr.Title,
-	}, nil
+	return mrFromGitlab(ref.Repo, mr), nil
 }
 
 func (c *client) Comment(ctx context.Context, ref vcs.MergeRequest, body string) error {
@@ -71,6 +66,105 @@ func (c *client) Comment(ctx context.Context, ref vcs.MergeRequest, body string)
 		return fmt.Errorf("create note: %w", err)
 	}
 	return nil
+}
+
+// ListComments returns all non-system notes on the MR created after `since`.
+// GitLab has no native "since" filter for notes so we page until we pass
+// the cursor.
+func (c *client) ListComments(ctx context.Context, ref vcs.MergeRequest, since time.Time) ([]vcs.ReviewComment, error) {
+	opts := &glab.ListMergeRequestNotesOptions{
+		Sort:    glab.Ptr("asc"),
+		OrderBy: glab.Ptr("created_at"),
+		ListOptions: glab.ListOptions{PerPage: 100},
+	}
+	var out []vcs.ReviewComment
+	for {
+		notes, resp, err := c.c.Notes.ListMergeRequestNotes(c.projectPath, ref.IID, opts, glab.WithContext(ctx))
+		if err != nil {
+			return nil, fmt.Errorf("list mr notes: %w", err)
+		}
+		for _, n := range notes {
+			if n.System {
+				continue // state-change noise ("approved", "pushed commit ...")
+			}
+			created := time.Time{}
+			if n.CreatedAt != nil {
+				created = *n.CreatedAt
+			}
+			if !since.IsZero() && !created.After(since) {
+				continue
+			}
+			author := ""
+			if n.Author.Username != "" {
+				author = n.Author.Username
+			}
+			out = append(out, vcs.ReviewComment{
+				ID:        strconv.Itoa(n.ID),
+				Author:    author,
+				Body:      n.Body,
+				CreatedAt: created,
+				URL:       fmt.Sprintf("%s#note_%d", ref.URL, n.ID),
+			})
+		}
+		if resp == nil || resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return out, nil
+}
+
+// ReplyToComment posts a new MR note that quotes the parent. GitLab's
+// CreateMergeRequestDiscussion can thread a reply to a discussion, but
+// requires the parent's discussion_id which we don't track — top-level
+// quoted reply is semantically equivalent for reviewers.
+func (c *client) ReplyToComment(ctx context.Context, ref vcs.MergeRequest, parent vcs.ReviewComment, body string) error {
+	var b strings.Builder
+	if parent.Author != "" && parent.Body != "" {
+		first := strings.TrimSpace(strings.SplitN(parent.Body, "\n", 2)[0])
+		if len(first) > 160 {
+			first = first[:157] + "…"
+		}
+		fmt.Fprintf(&b, "> @%s: %s\n\n", parent.Author, first)
+	}
+	b.WriteString(body)
+	return c.Comment(ctx, ref, b.String())
+}
+
+func (c *client) BotIdentity(ctx context.Context) (string, error) {
+	c.botOnce.Do(func() {
+		u, _, err := c.c.Users.CurrentUser(glab.WithContext(ctx))
+		if err != nil {
+			c.botErr = fmt.Errorf("gitlab current user: %w", err)
+			return
+		}
+		c.botID = u.Username
+	})
+	return c.botID, c.botErr
+}
+
+func mrFromGitlab(repoName string, mr *glab.MergeRequest) vcs.MergeRequest {
+	out := vcs.MergeRequest{
+		Repo:         repoName,
+		IID:          mr.IID,
+		URL:          mr.WebURL,
+		State:        mr.State,
+		Title:        mr.Title,
+		SourceBranch: mr.SourceBranch,
+		TargetBranch: mr.TargetBranch,
+	}
+	if mr.ClosedAt != nil {
+		t := *mr.ClosedAt
+		out.ClosedAt = &t
+	}
+	if mr.MergedAt != nil {
+		t := *mr.MergedAt
+		out.MergedAt = &t
+		if out.ClosedAt == nil {
+			out.ClosedAt = &t
+		}
+	}
+	return out
 }
 
 func titleOrDraft(title string, draft bool) string {

@@ -128,6 +128,16 @@ func main() {
 	}
 	logf("opencode pid=%d port=%s", cmd.Process.Pid, ocPort)
 
+	// Seed per-repo projects. Opencode's InstanceMiddleware auto-registers
+	// a project the first time a request arrives with ?directory=... set
+	// to a git-initialised worktree. We call GET /project/current once
+	// per cloned repo so they all appear in the web UI project picker
+	// without the user having to navigate. Fires in the background so
+	// startup isn't blocked on opencode readiness.
+	if eager {
+		go seedRepoProjects(repos, ocPort)
+	}
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 
@@ -556,6 +566,44 @@ func resumeAgentBranch(dest, repoName, branch string) {
 		return
 	}
 	logf("resumed prior agent branch %s in %s", branch, repoName)
+}
+
+// seedRepoProjects pings opencode /project/current?directory=<repo> for
+// each cloned repo so the web UI's project picker shows them all. Retries
+// a handful of times because opencode's HTTP server may not be ready
+// immediately after spawn.
+func seedRepoProjects(repos []repo, port string) {
+	if len(repos) == 0 {
+		return
+	}
+	base := "http://127.0.0.1:" + port
+	client := &http.Client{Timeout: 5 * time.Second}
+	// Wait for opencode to be reachable.
+	for i := 0; i < 30; i++ {
+		resp, err := client.Get(base + "/app")
+		if err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode < 500 {
+				break
+			}
+		}
+		time.Sleep(time.Second)
+	}
+	for _, r := range repos {
+		dir := filepath.Join(workspaceDir, r.Name)
+		u := base + "/project/current?directory=" + url.QueryEscape(dir)
+		resp, err := client.Get(u)
+		if err != nil {
+			logf("seed project %s: %v", r.Name, err)
+			continue
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode >= 300 {
+			logf("seed project %s: HTTP %d", r.Name, resp.StatusCode)
+			continue
+		}
+		logf("seeded opencode project: %s (dir=%s)", r.Name, dir)
+	}
 }
 
 func urlWithToken(raw, token string) (string, bool) {

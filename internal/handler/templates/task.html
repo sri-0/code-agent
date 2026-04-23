@@ -39,13 +39,26 @@
 
   <h2>Repos</h2>
   <table>
-    <thead><tr><th>Name</th><th>URL</th><th>Base</th><th>Branch</th></tr></thead>
+    <thead><tr><th>Name</th><th>URL</th><th>Base</th><th>Branch</th><th>Opencode</th></tr></thead>
     <tbody>
     {{range .Task.Repos}}
-      <tr><td>{{.Name}}</td><td><code>{{.URL}}</code></td><td>{{.BaseBranch}}</td><td><code>{{.Branch}}</code></td></tr>
+      <tr>
+        <td>{{.Name}}</td>
+        <td><code>{{.URL}}</code></td>
+        <td>{{.BaseBranch}}</td>
+        <td><code>{{.Branch}}</code></td>
+        <td>
+          {{if $.Task.WorkerRef.URL}}
+            <a href="{{$.Task.WorkerRef.URL}}/?directory=/workspace/{{.Name}}" target="_blank">open</a>
+          {{else}}
+            <span class="muted">—</span>
+          {{end}}
+        </td>
+      </tr>
     {{end}}
     </tbody>
   </table>
+  <p class="muted">opencode server: {{if .Task.WorkerRef.URL}}<code>{{.Task.WorkerRef.URL}}</code>{{else}}(not running){{end}}</p>
 
   {{if .Task.MergeRequests}}
   <h2>Merge/Pull Requests</h2>

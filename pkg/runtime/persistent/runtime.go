@@ -27,6 +27,7 @@ import (
 	"code-agent/pkg/runtime"
 	"code-agent/pkg/tasks"
 	"code-agent/pkg/transcript"
+	"code-agent/pkg/vcs"
 )
 
 type Runtime struct {
@@ -39,12 +40,25 @@ type Runtime struct {
 	openCode config.OpenCodeConfig
 	git      config.GitIdentity
 
+	// GC config — see Deps.
+	taskStore        tasks.Store
+	boards           *config.BoardsConfig
+	ttlAfterMRClosed time.Duration
+	ttlMax           time.Duration
+	gcInterval       time.Duration
+
 	mu       sync.Mutex
 	clients  map[string]*opencode.Client
 	sessions map[string]string
 	forwards map[string]*k8s.PortForward // task id -> tunnel (out-of-cluster only)
 	refs     map[string]*tasks.WorkerRef // task id -> cached full ref (includes AdminURL, port-forward URLs)
+	// podBirth is when each pod was first created. Used by the GC to
+	// enforce the absolute-max lifetime regardless of MR state.
+	podBirth map[string]time.Time
 	password string
+	// gcOnce + gcDone let us start exactly one GC goroutine across the
+	// orchestrator's lifetime.
+	gcOnce sync.Once
 }
 
 func (r *Runtime) Mode() string { return "persistent" }
@@ -177,6 +191,9 @@ func (r *Runtime) EnsureWorker(ctx context.Context, t *tasks.Task, b config.Boar
 	if fwd != nil {
 		r.forwards[t.ID] = fwd
 	}
+	if _, ok := r.podBirth[t.ID]; !ok {
+		r.podBirth[t.ID] = time.Now()
+	}
 	// Cache the ref too — subsequent EnsureWorker calls return the same
 	// URL/AdminURL so downstream actions (open_mr) reach the pod via the
 	// port-forward, not an unreachable svc.cluster.local DNS name.
@@ -250,12 +267,185 @@ func (r *Runtime) Cleanup(ctx context.Context, t *tasks.Task) error {
 	delete(r.clients, t.ID)
 	delete(r.sessions, t.ID)
 	delete(r.refs, t.ID)
+	delete(r.podBirth, t.ID)
 	if fwd, ok := r.forwards[t.ID]; ok {
 		fwd.Close()
 		delete(r.forwards, t.ID)
 	}
 	r.mu.Unlock()
 	return r.k.DeleteDeployment(ctx, r.cfg.Namespace, dn)
+}
+
+// StartGC launches the idle-pod garbage collector goroutine. Safe to call
+// multiple times — the first wins, subsequent calls are no-ops. The
+// goroutine runs until ctx is cancelled.
+//
+// GC policy:
+//  1. For each live pod (in r.refs), load its task from the store.
+//  2. Age 1 — absolute max: pod age > ttlMax → Cleanup (catches runaways).
+//  3. Age 2 — all MRs closed/merged + (now - latest close) > ttlAfterMRClosed → Cleanup.
+//     MR state is refreshed from the VCS provider on each scan, and the
+//     task record gets its ClosedAt/MergedAt populated for observability.
+//  4. No MRs on the task yet → covered by ttlMax only. Lets plan/implement
+//     stages complete without the GC prematurely reaping them.
+func (r *Runtime) StartGC(ctx context.Context) {
+	r.gcOnce.Do(func() {
+		if r.taskStore == nil {
+			r.logger.Info().Msg("persistent GC disabled (no task store)")
+			return
+		}
+		interval := r.gcInterval
+		if interval <= 0 {
+			interval = 10 * time.Minute
+		}
+		r.logger.Info().
+			Dur("interval", interval).
+			Dur("ttl_after_mr_closed", r.ttlAfterMRClosed).
+			Dur("ttl_max", r.ttlMax).
+			Msg("persistent GC starting")
+		go func() {
+			t := time.NewTicker(interval)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					r.gcTick(ctx)
+				}
+			}
+		}()
+	})
+}
+
+func (r *Runtime) gcTick(ctx context.Context) {
+	r.mu.Lock()
+	taskIDs := make([]string, 0, len(r.refs))
+	births := make(map[string]time.Time, len(r.podBirth))
+	for id := range r.refs {
+		taskIDs = append(taskIDs, id)
+		births[id] = r.podBirth[id]
+	}
+	r.mu.Unlock()
+
+	if len(taskIDs) == 0 {
+		return
+	}
+	now := time.Now()
+	for _, tid := range taskIDs {
+		t, err := r.taskStore.Get(ctx, tid)
+		if err != nil || t == nil {
+			// Task record gone but pod still around — reap it anyway.
+			r.logger.Warn().Str("task", tid).Err(err).Msg("GC: task record missing; cleaning pod")
+			r.forceCleanup(ctx, tid)
+			continue
+		}
+		// Rule 1: absolute max lifetime.
+		if r.ttlMax > 0 {
+			birth, ok := births[tid]
+			if ok && now.Sub(birth) > r.ttlMax {
+				r.logger.Info().Str("task", tid).Dur("age", now.Sub(birth)).Msg("GC: pod exceeded ttl_max; cleaning up")
+				_ = r.Cleanup(ctx, t)
+				continue
+			}
+		}
+		// Rule 2: MR-closed grace.
+		if len(t.MergeRequests) > 0 && r.ttlAfterMRClosed > 0 {
+			latestClose, allClosed := r.refreshMRStates(ctx, t)
+			if allClosed && !latestClose.IsZero() && now.Sub(latestClose) > r.ttlAfterMRClosed {
+				r.logger.Info().
+					Str("task", tid).
+					Time("latest_close", latestClose).
+					Msg("GC: all MRs closed past grace period; cleaning up")
+				_ = r.Cleanup(ctx, t)
+				continue
+			}
+		}
+	}
+}
+
+// refreshMRStates queries each MR on the task via VCS, updates the task
+// record in-place, and returns (latestCloseTime, allClosedOrMerged).
+// Any refresh error leaves that MR's state untouched and the overall
+// allClosed flag becomes false.
+func (r *Runtime) refreshMRStates(ctx context.Context, t *tasks.Task) (time.Time, bool) {
+	if r.boards == nil {
+		return time.Time{}, false
+	}
+	board, ok := r.boards.ByID(t.BoardID)
+	if !ok {
+		return time.Time{}, false
+	}
+	dirty := false
+	allClosed := true
+	var latest time.Time
+	for i, mr := range t.MergeRequests {
+		br, ok := findBoardRepo(board, mr.Repo)
+		if !ok {
+			allClosed = false
+			continue
+		}
+		client, err := vcs.Build(br)
+		if err != nil {
+			r.logger.Debug().Err(err).Str("repo", mr.Repo).Msg("GC: vcs.Build failed; skipping MR")
+			allClosed = false
+			continue
+		}
+		refreshCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		fresh, err := client.GetMR(refreshCtx, vcs.MergeRequest{Repo: mr.Repo, IID: mr.IID, Number: mr.Number})
+		cancel()
+		if err != nil {
+			r.logger.Debug().Err(err).Str("repo", mr.Repo).Msg("GC: GetMR failed; skipping")
+			allClosed = false
+			continue
+		}
+		if fresh.State != mr.State {
+			dirty = true
+		}
+		t.MergeRequests[i].State = fresh.State
+		if fresh.ClosedAt != nil {
+			t.MergeRequests[i].ClosedAt = fresh.ClosedAt
+			if fresh.ClosedAt.After(latest) {
+				latest = *fresh.ClosedAt
+			}
+		}
+		if fresh.MergedAt != nil {
+			t.MergeRequests[i].MergedAt = fresh.MergedAt
+		}
+		if fresh.State != "closed" && fresh.State != "merged" {
+			allClosed = false
+		}
+	}
+	if dirty {
+		_ = r.taskStore.Update(ctx, t)
+	}
+	return latest, allClosed
+}
+
+func (r *Runtime) forceCleanup(ctx context.Context, taskID string) {
+	r.mu.Lock()
+	ref := r.refs[taskID]
+	delete(r.clients, taskID)
+	delete(r.sessions, taskID)
+	delete(r.refs, taskID)
+	delete(r.podBirth, taskID)
+	if fwd, ok := r.forwards[taskID]; ok {
+		fwd.Close()
+		delete(r.forwards, taskID)
+	}
+	r.mu.Unlock()
+	if ref != nil && ref.Name != "" {
+		_ = r.k.DeleteDeployment(ctx, r.cfg.Namespace, ref.Name)
+	}
+}
+
+func findBoardRepo(b config.Board, name string) (config.BoardRepo, bool) {
+	for _, r := range b.Repos {
+		if r.Name == name {
+			return r, true
+		}
+	}
+	return config.BoardRepo{}, false
 }
 
 // ---- helpers ----
@@ -366,18 +556,24 @@ func init() {
 			return nil, fmt.Errorf("k8s client: %w", err)
 		}
 		return &Runtime{
-			name:     name,
-			cfg:      cfg,
-			logger:   deps.Logger.With().Str("runtime", "persistent").Str("name", name).Logger(),
-			tx:       deps.Transcript,
-			k:        kc,
-			openCode: deps.OpenCode,
-			git:      deps.Git,
-			clients:  map[string]*opencode.Client{},
-			sessions: map[string]string{},
-			forwards: map[string]*k8s.PortForward{},
-			refs:     map[string]*tasks.WorkerRef{},
-			password: "", // no opencode auth for in-cluster use; probe-friendly
+			name:             name,
+			cfg:              cfg,
+			logger:           deps.Logger.With().Str("runtime", "persistent").Str("name", name).Logger(),
+			tx:               deps.Transcript,
+			k:                kc,
+			openCode:         deps.OpenCode,
+			git:              deps.Git,
+			taskStore:        deps.Tasks,
+			boards:           deps.Boards,
+			ttlAfterMRClosed: deps.TTLAfterMRClosed,
+			ttlMax:           deps.TTLMax,
+			gcInterval:       deps.GCInterval,
+			clients:          map[string]*opencode.Client{},
+			sessions:         map[string]string{},
+			forwards:         map[string]*k8s.PortForward{},
+			refs:             map[string]*tasks.WorkerRef{},
+			podBirth:         map[string]time.Time{},
+			password:         "", // no opencode auth for in-cluster use; probe-friendly
 		}, nil
 	})
 }

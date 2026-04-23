@@ -15,8 +15,11 @@ import (
 
 	"code-agent/internal/config"
 	"code-agent/pkg/actions"
+	reviewact "code-agent/pkg/actions/review"
+	"code-agent/pkg/llm"
 	"code-agent/pkg/providers"
 	_ "code-agent/pkg/providers/all" // register providers
+	"code-agent/pkg/review"
 	"code-agent/pkg/runtime"
 	_ "code-agent/pkg/runtime/all" // register runtimes
 	"code-agent/pkg/stages"
@@ -26,12 +29,13 @@ import (
 )
 
 type Orchestrator struct {
-	cfg    *config.Config
-	logger zerolog.Logger
-	tasks  tasks.Store
-	tx     transcript.Store
-	disp   *providers.Dispatcher
-	engine *stages.Engine
+	cfg          *config.Config
+	logger       zerolog.Logger
+	tasks        tasks.Store
+	tx           transcript.Store
+	disp         *providers.Dispatcher
+	engine       *stages.Engine
+	reviewPoller *review.Poller
 
 	runtimes    map[string]runtime.Runtime
 	agentRunner *runtime.AgentRunner
@@ -61,10 +65,15 @@ func New(cfg *config.Config, logger zerolog.Logger, taskStore tasks.Store, tx tr
 				git = cfg.Runtimes.Git
 			}
 			rt, err := runtime.Build(name, rcfg, runtime.Deps{
-				Logger:     o.logger,
-				Transcript: tx,
-				OpenCode:   cfg.OpenCode,
-				Git:        git,
+				Logger:           o.logger,
+				Transcript:       tx,
+				Tasks:            taskStore,
+				Boards:           cfg.Boards,
+				OpenCode:         cfg.OpenCode,
+				Git:              git,
+				TTLAfterMRClosed: cfg.PodTTLAfterMRClosed,
+				TTLMax:           cfg.PodTTLMax,
+				GCInterval:       cfg.PodGCInterval,
 			})
 			if err != nil {
 				o.logger.Error().Err(err).Str("runtime", name).Msg("failed to build runtime")
@@ -76,11 +85,27 @@ func New(cfg *config.Config, logger zerolog.Logger, taskStore tasks.Store, tx tr
 	}
 
 	// Wire the run_agent action runner.
-	o.agentRunner = runtime.NewAgentRunner(o.runtimes, tx, cfg.Skills)
+	o.agentRunner = runtime.NewAgentRunner(o.runtimes, tx, taskStore, cfg.Skills)
 	o.engine.Register("run_agent", o.agentRunner)
 
 	// Wire the open_mr action runner (stateless / lazy vcs client cache).
 	o.engine.Register("open_mr", actions.NewOpenMRRunner())
+
+	// Wire the PR-review feedback loop. The poller watches open MRs for
+	// new review comments and hands each one to the review action
+	// handler, which classifies (explain vs change) and drives opencode.
+	llmClient, llmErr := llm.New(llm.Options{})
+	if llmErr != nil {
+		o.logger.Warn().Err(llmErr).Msg("LLM client unavailable; PR review loop disabled")
+	}
+	if llmClient != nil {
+		reviewHandler := &reviewact.Handler{
+			Runtimes: o.runtimes,
+			LLM:      llmClient,
+			Logger:   o.logger,
+		}
+		o.reviewPoller = review.New(taskStore, cfg.Boards, cfg.PodGCInterval, o.logger, reviewHandler.Handle)
+	}
 
 	if cfg.Boards == nil {
 		o.logger.Warn().Msg("no boards configured; orchestrator idle")
@@ -133,6 +158,16 @@ func (o *Orchestrator) Start(ctx context.Context) {
 				interval = b.Triggers.Poll.Interval
 			}
 		}
+	}
+	// Runtimes that ship their own background GC (currently only
+	// `persistent` for pod TTL) opt in via the GCCapable interface.
+	for _, rt := range o.runtimes {
+		if gc, ok := rt.(runtime.GCCapable); ok {
+			gc.StartGC(ctx)
+		}
+	}
+	if o.reviewPoller != nil {
+		go o.reviewPoller.Start(ctx)
 	}
 	o.disp.StartPollers(ctx, interval)
 	go o.consume(ctx)

@@ -184,6 +184,65 @@ Schema:
 	return s, nil
 }
 
+// ReviewCommentKind is the coarse classification of a PR review comment.
+type ReviewCommentKind string
+
+const (
+	ReviewKindQuestion      ReviewCommentKind = "question"
+	ReviewKindChangeRequest ReviewCommentKind = "change_request"
+	ReviewKindApproval      ReviewCommentKind = "approval"
+	ReviewKindNoise         ReviewCommentKind = "noise"
+)
+
+// ReviewClassification is the structured output of ClassifyReviewComment.
+type ReviewClassification struct {
+	Kind       ReviewCommentKind `json:"kind"`
+	Confidence float64           `json:"confidence"`
+	Reason     string            `json:"reason"`
+}
+
+// ClassifyReviewComment decides whether a PR comment is asking for a code
+// change, asking a question, approving, or chatter. Low-confidence results
+// fall through to `question` (safer — no code changes on ambiguity).
+func (c *Client) ClassifyReviewComment(ctx context.Context, prTitle, commentAuthor, commentBody string) (ReviewClassification, error) {
+	system := `You classify a single PR review comment into exactly one of:
+- question: reviewer is asking for clarification or explanation; no code change needed
+- change_request: reviewer wants something in the code modified
+- approval: reviewer is approving or thanking; no further action needed
+- noise: off-topic or chatter between humans not directed at the author
+
+Respond with a single JSON object, no markdown or prose:
+{"kind": "question|change_request|approval|noise", "confidence": 0.0-1.0, "reason": "one short sentence"}`
+
+	user := fmt.Sprintf("PR title: %s\nComment author: %s\nComment:\n%s", prTitle, commentAuthor, commentBody)
+	raw, err := c.Chat(ctx, system, user)
+	if err != nil {
+		return ReviewClassification{Kind: ReviewKindQuestion, Confidence: 0, Reason: "classifier error; defaulting to question"}, err
+	}
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimPrefix(raw, "```json")
+	raw = strings.TrimPrefix(raw, "```")
+	raw = strings.TrimSuffix(raw, "```")
+	raw = strings.TrimSpace(raw)
+	var out ReviewClassification
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return ReviewClassification{Kind: ReviewKindQuestion, Confidence: 0, Reason: "parse failure; defaulting to question"}, fmt.Errorf("classify: parse: %w (%s)", err, truncatePreview(raw))
+	}
+	switch out.Kind {
+	case ReviewKindQuestion, ReviewKindChangeRequest, ReviewKindApproval, ReviewKindNoise:
+	default:
+		out.Kind = ReviewKindQuestion
+		out.Reason = "unknown kind " + string(out.Kind) + "; coerced to question"
+	}
+	// Safety net: if confidence is low, force into question mode so we
+	// never touch code on an ambiguous signal.
+	if out.Confidence < 0.7 && out.Kind == ReviewKindChangeRequest {
+		out.Kind = ReviewKindQuestion
+		out.Reason = "low confidence on change_request; downgraded to question"
+	}
+	return out, nil
+}
+
 func fallbackSummary(ticket, title, repoName string) ChangeSummary {
 	return ChangeSummary{
 		CommitMessage: fmt.Sprintf("%s %s\n\nAutomated change (LLM summary unavailable).", ticket, title),

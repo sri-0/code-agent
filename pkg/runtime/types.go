@@ -10,6 +10,7 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/rs/zerolog"
 
@@ -41,6 +42,15 @@ type Runtime interface {
 type Deps struct {
 	Logger     zerolog.Logger
 	Transcript transcript.Store
+	// Tasks is the orchestrator's task store. The persistent runtime's
+	// GC goroutine uses it to iterate live tasks when deciding which pods
+	// to age off. Nil is tolerated — runtimes that don't GC (local,
+	// shared, ephemeral) ignore it.
+	Tasks tasks.Store
+	// Boards is the static board config. Persistent-runtime GC needs it
+	// to build a VCS client for refreshing MR state on each scan. Nil is
+	// tolerated but disables MR-state-based TTLs.
+	Boards *config.BoardsConfig
 	// OpenCode is the opencode.json content to inject into worker pods
 	// (ephemeral/persistent/shared). Local runtime ignores it — the host
 	// opencode has its own config file. Nil means cmd/runner will fall
@@ -52,6 +62,20 @@ type Deps struct {
 	// behalf of the agent. Applied via `git config --global` at pod
 	// startup. Empty fields fall back to runner-side defaults.
 	Git config.GitIdentity
+	// TTLAfterMRClosed / TTLMax / GCInterval are only meaningful for
+	// the persistent runtime (others ignore). Zero values fall back to
+	// the runtime's own sane defaults.
+	TTLAfterMRClosed time.Duration
+	TTLMax           time.Duration
+	GCInterval       time.Duration
+}
+
+// GCCapable is implemented by runtimes that need a background
+// garbage-collection goroutine (currently only persistent). The
+// orchestrator calls StartGC once on startup with the server's lifetime
+// context; the goroutine exits when ctx is cancelled.
+type GCCapable interface {
+	StartGC(ctx context.Context)
 }
 
 // Factory builds a Runtime instance from a named runtime config entry.

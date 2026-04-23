@@ -167,11 +167,13 @@ func (r *OpenMRRunner) Run(ctx context.Context, in stages.ActionInput) (stages.A
 		logger.Info().Str("repo", rp.Name).Str("url", mr.URL).Msg("PR opened")
 		opened = append(opened, mr)
 		newRefs = append(newRefs, tasks.MergeRef{
-			Repo:   rp.Name,
-			URL:    mr.URL,
-			IID:    mr.IID,
-			Number: mr.Number,
-			State:  "open",
+			Repo:         rp.Name,
+			URL:          mr.URL,
+			IID:          mr.IID,
+			Number:       mr.Number,
+			State:        "open",
+			SourceBranch: branch,
+			TargetBranch: rp.BaseBranch,
 		})
 		fmt.Fprintf(&summary, "- %s: %s\n", rp.Name, mr.URL)
 	}
@@ -241,6 +243,29 @@ func (r *OpenMRRunner) crosslink(ctx context.Context, logger zerolog.Logger, mrs
 type gitDriver interface {
 	getStatusAndDiff(ctx context.Context, repoName string) (dirty bool, diff string, err error)
 	commitAndPush(ctx context.Context, repoName, branch, baseBranch, commitMessage string) error
+}
+
+// PodGitDriver is the exported shape of the pod-side git driver.
+// Used by pkg/actions/review to commit+push feedback edits on the feature
+// branch without rebuilding the whole action.
+type PodGitDriver interface {
+	GetStatusAndDiff(ctx context.Context, repoName string) (dirty bool, diff string, err error)
+	CommitAndPush(ctx context.Context, repoName, branch, baseBranch, commitMessage string) error
+}
+
+// NewPodDriver constructs a PodGitDriver talking to the cmd/runner admin
+// HTTP at adminURL. Thin wrapper over the internal podDriver.
+func NewPodDriver(adminURL string, logger zerolog.Logger) PodGitDriver {
+	return &exportedPodDriver{inner: &podDriver{adminURL: adminURL, logger: logger}}
+}
+
+type exportedPodDriver struct{ inner *podDriver }
+
+func (e *exportedPodDriver) GetStatusAndDiff(ctx context.Context, repo string) (bool, string, error) {
+	return e.inner.getStatusAndDiff(ctx, repo)
+}
+func (e *exportedPodDriver) CommitAndPush(ctx context.Context, repo, branch, base, msg string) error {
+	return e.inner.commitAndPush(ctx, repo, branch, base, msg)
 }
 
 // podDriver talks to cmd/runner's admin HTTP.

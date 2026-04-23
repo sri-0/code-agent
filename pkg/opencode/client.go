@@ -18,6 +18,12 @@ type Client struct {
 	http   *httpclient.Client
 	logger zerolog.Logger
 	pw     string
+	// directory, when non-empty, is attached as the `x-opencode-directory`
+	// header on every request. Opencode's InstanceMiddleware resolves
+	// this to a per-request project/worktree — letting multiple projects
+	// live under one server (e.g. /workspace/repoA vs /workspace/repoB).
+	// See packages/opencode/src/server/routes/instance/middleware.ts.
+	directory string
 }
 
 type Options struct {
@@ -61,6 +67,29 @@ func New(opts Options, logger zerolog.Logger) *Client {
 // BaseURL returns the configured base URL (used by SSE which needs a raw http.Client).
 func (c *Client) BaseURL() string { return c.base }
 
+// WithDirectory returns a shallow clone of the client with its per-request
+// opencode directory pinned to dir. Every request made via the returned
+// client carries `x-opencode-directory: <dir>`, which opencode uses to
+// resolve the project/worktree. Empty dir = unpinned.
+func (c *Client) WithDirectory(dir string) *Client {
+	cp := *c
+	cp.directory = dir
+	return &cp
+}
+
+// Directory returns the directory this client is scoped to, or empty.
+func (c *Client) Directory() string { return c.directory }
+
+// do wraps http.Do injecting the directory header when set.
+func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
+	var h http.Header
+	if c.directory != "" {
+		h = http.Header{}
+		h.Set("x-opencode-directory", c.directory)
+	}
+	return c.http.Do(ctx, method, path, body, out, h)
+}
+
 // AuthHeader returns the Authorization header value, or empty.
 func (c *Client) AuthHeader() string {
 	if c.pw == "" {
@@ -71,7 +100,7 @@ func (c *Client) AuthHeader() string {
 
 // Health pings the server's /app endpoint as a liveness check.
 func (c *Client) Health(ctx context.Context) error {
-	return c.http.Do(ctx, http.MethodGet, "/app", nil, nil, nil)
+	return c.do(ctx, http.MethodGet, "/app", nil, nil)
 }
 
 // Project mirrors the subset of opencode's project shape we need.
@@ -84,7 +113,7 @@ type Project struct {
 // CurrentProject returns the project opencode has active.
 func (c *Client) CurrentProject(ctx context.Context) (*Project, error) {
 	var p Project
-	if err := c.http.Do(ctx, http.MethodGet, "/project/current", nil, &p, nil); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/project/current", nil, &p); err != nil {
 		return nil, fmt.Errorf("get current project: %w", err)
 	}
 	return &p, nil
@@ -100,7 +129,7 @@ type ConfigSnapshot struct {
 // Config fetches the server's effective config.
 func (c *Client) Config(ctx context.Context) (*ConfigSnapshot, error) {
 	var s ConfigSnapshot
-	if err := c.http.Do(ctx, http.MethodGet, "/config", nil, &s, nil); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/config", nil, &s); err != nil {
 		return nil, fmt.Errorf("get config: %w", err)
 	}
 	return &s, nil
@@ -114,7 +143,7 @@ func (c *Client) Config(ctx context.Context) (*ConfigSnapshot, error) {
 // an existing git repo).
 func (c *Client) EnsureGitProject(ctx context.Context) (*Project, error) {
 	var p Project
-	if err := c.http.Do(ctx, http.MethodPost, "/project/git/init", map[string]any{}, &p, nil); err != nil {
+	if err := c.do(ctx, http.MethodPost, "/project/git/init", map[string]any{}, &p); err != nil {
 		return nil, fmt.Errorf("project/git/init: %w", err)
 	}
 	return &p, nil
@@ -127,7 +156,7 @@ func (c *Client) CreateSession(ctx context.Context, title string) (*Session, err
 		body["title"] = title
 	}
 	var s Session
-	if err := c.http.Do(ctx, http.MethodPost, "/session", body, &s, nil); err != nil {
+	if err := c.do(ctx, http.MethodPost, "/session", body, &s); err != nil {
 		return nil, fmt.Errorf("create session: %w", err)
 	}
 	return &s, nil
@@ -145,7 +174,7 @@ func (c *Client) PostMessage(ctx context.Context, sessionID string, req PostMess
 	if len(req.Parts) == 0 {
 		return fmt.Errorf("parts required")
 	}
-	return c.http.Do(ctx, http.MethodPost, "/session/"+sessionID+"/message", req, nil, nil)
+	return c.do(ctx, http.MethodPost, "/session/"+sessionID+"/message", req, nil)
 }
 
 // PostMessageAsync submits a prompt and returns as soon as opencode has
@@ -159,12 +188,12 @@ func (c *Client) PostMessageAsync(ctx context.Context, sessionID string, req Pos
 	if len(req.Parts) == 0 {
 		return fmt.Errorf("parts required")
 	}
-	return c.http.Do(ctx, http.MethodPost, "/session/"+sessionID+"/prompt_async", req, nil, nil)
+	return c.do(ctx, http.MethodPost, "/session/"+sessionID+"/prompt_async", req, nil)
 }
 
 // AbortSession cancels the in-flight turn for the session.
 func (c *Client) AbortSession(ctx context.Context, sessionID string) error {
-	return c.http.Do(ctx, http.MethodPost, "/session/"+sessionID+"/abort", nil, nil, nil)
+	return c.do(ctx, http.MethodPost, "/session/"+sessionID+"/abort", nil, nil)
 }
 
 // SessionMessage is the envelope opencode returns from
@@ -210,7 +239,7 @@ type MessageErrorData struct {
 // tail.
 func (c *Client) Messages(ctx context.Context, sessionID string) ([]SessionMessage, error) {
 	var out []SessionMessage
-	if err := c.http.Do(ctx, http.MethodGet, "/session/"+sessionID+"/message", nil, &out, nil); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/session/"+sessionID+"/message", nil, &out); err != nil {
 		return nil, fmt.Errorf("get messages: %w", err)
 	}
 	return out, nil

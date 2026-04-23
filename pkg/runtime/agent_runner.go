@@ -31,6 +31,7 @@ import (
 type AgentRunner struct {
 	runtimes map[string]Runtime // runtime config name -> instance
 	tx       transcript.Store
+	tasks    tasks.Store         // for persisting WorkerRef mid-run
 	skills   *config.SkillsIndex // host-side skill bundle index (may be nil)
 
 	// streamWG tracks transcript writers so server shutdown can drain them.
@@ -38,9 +39,12 @@ type AgentRunner struct {
 }
 
 // NewAgentRunner constructs the action runner. skills may be nil when
-// the orchestrator has no CODE_AGENT_SKILLS_DIR configured.
-func NewAgentRunner(runtimes map[string]Runtime, tx transcript.Store, skills *config.SkillsIndex) *AgentRunner {
-	return &AgentRunner{runtimes: runtimes, tx: tx, skills: skills}
+// the orchestrator has no CODE_AGENT_SKILLS_DIR configured. taskStore may
+// be nil; if non-nil it is used to persist the worker ref right after
+// EnsureWorker so the dashboard can surface the live pod URL during the
+// (potentially long) agent turn instead of only after it completes.
+func NewAgentRunner(runtimes map[string]Runtime, tx transcript.Store, taskStore tasks.Store, skills *config.SkillsIndex) *AgentRunner {
+	return &AgentRunner{runtimes: runtimes, tx: tx, tasks: taskStore, skills: skills}
 }
 
 // Wait blocks until any in-flight streams finish.
@@ -71,6 +75,18 @@ func (r *AgentRunner) Run(ctx context.Context, in stages.ActionInput) (stages.Ac
 	}
 	in.Task.WorkerRef = *ref
 	in.Task.RuntimeMode = rt.Mode()
+	// Persist the worker ref NOW — the agent turn below can take many
+	// minutes, and the stage engine only runs Mutate (which saves the
+	// task) after the action returns. Without this, the dashboard reads
+	// an empty WorkerRef mid-run and users can't open the live opencode
+	// UI to observe progress.
+	if r.tasks != nil {
+		saveCtx, cancelSave := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := r.tasks.Update(saveCtx, in.Task); err != nil {
+			in.Logger.Warn().Err(err).Msg("early worker-ref persist failed")
+		}
+		cancelSave()
+	}
 
 	// Ship skill bundles (union of board.skills + stage.skills) to the
 	// worker before the first prompt of this stage. Non-fatal on error —

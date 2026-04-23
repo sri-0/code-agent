@@ -13,18 +13,23 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"code-agent/internal/config"
 )
 
 // MergeRequest is the provider-neutral view of a merge/pull request.
 type MergeRequest struct {
-	Repo   string // boards.yaml repo name
-	Number int    // GitHub PR number (or 0)
-	IID    int    // GitLab MR IID (or 0)
-	URL    string
-	State  string // open | merged | closed
-	Title  string
+	Repo         string // boards.yaml repo name
+	Number       int    // GitHub PR number (or 0)
+	IID          int    // GitLab MR IID (or 0)
+	URL          string
+	State        string     // open | merged | closed
+	Title        string
+	SourceBranch string     // feature branch (e.g. ai/<ticket>)
+	TargetBranch string     // base branch
+	ClosedAt     *time.Time // set when state=closed/merged
+	MergedAt     *time.Time // set when merged
 }
 
 // OpenMRRequest is the input to Client.OpenMR.
@@ -39,12 +44,37 @@ type OpenMRRequest struct {
 	Draft bool
 }
 
+// ReviewComment is one comment on a merge/pull request. We treat both
+// GitHub issue comments and GitHub review comments as the same shape for
+// review-feedback purposes. ParentID, when non-empty, means this comment
+// was posted as a reply to another comment (used to avoid self-loops).
+type ReviewComment struct {
+	ID       string // provider-specific stringified id
+	ParentID string // optional; empty if top-level
+	Author   string // login / username
+	Body     string
+	CreatedAt time.Time
+	URL      string
+}
+
 // Client is the MR/PR API surface we need.
 type Client interface {
 	Provider() string // "gitlab" | "github"
 	OpenMR(ctx context.Context, in OpenMRRequest) (MergeRequest, error)
 	GetMR(ctx context.Context, ref MergeRequest) (MergeRequest, error)
 	Comment(ctx context.Context, ref MergeRequest, body string) error
+	// ListComments returns all review comments on the MR whose CreatedAt
+	// is strictly after `since`. Ordered oldest first. Used by the review
+	// feedback poller.
+	ListComments(ctx context.Context, ref MergeRequest, since time.Time) ([]ReviewComment, error)
+	// ReplyToComment posts `body` as a reply to the given comment on the
+	// MR. If the provider doesn't support threaded replies, falls back
+	// to a top-level comment that quotes the parent's first line.
+	ReplyToComment(ctx context.Context, ref MergeRequest, parent ReviewComment, body string) error
+	// BotIdentity returns the username/login of the authenticated actor
+	// (so pollers can skip the bot's own comments). May be empty if the
+	// provider can't resolve it; callers treat empty as "don't dedupe".
+	BotIdentity(ctx context.Context) (string, error)
 }
 
 // Factory builds a Client from a BoardRepo's VCS config.
