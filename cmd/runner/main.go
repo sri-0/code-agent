@@ -366,10 +366,21 @@ func handleRepoCommitPush(w http.ResponseWriter, r *http.Request, dir string) {
 		http.Error(w, "branch and commit_message required", 400)
 		return
 	}
+	// Branch-selection logic:
+	//  * If the branch already exists locally (either because the agent
+	//    is already on it, or cmd/runner resumed a prior-run branch on
+	//    startup), just checkout plain — DO NOT reset it, or we'd wipe
+	//    any prior commits and produce a non-fast-forward push.
+	//  * If it doesn't exist, create from base_branch if provided, else
+	//    from whatever HEAD currently points at.
 	steps := [][]string{}
-	if req.BaseBranch != "" {
+	localExists := branchExistsLocal(dir, req.Branch)
+	switch {
+	case localExists:
+		steps = append(steps, []string{"checkout", req.Branch})
+	case req.BaseBranch != "":
 		steps = append(steps, []string{"checkout", "-B", req.Branch, req.BaseBranch})
-	} else {
+	default:
 		steps = append(steps, []string{"checkout", "-B", req.Branch})
 	}
 	steps = append(steps,
@@ -384,6 +395,12 @@ func handleRepoCommitPush(w http.ResponseWriter, r *http.Request, dir string) {
 		}
 	}
 	w.WriteHeader(204)
+}
+
+func branchExistsLocal(dir, branch string) bool {
+	// show-ref --verify --quiet exits 0 iff the ref exists.
+	err := exec.Command("git", "-C", dir, "show-ref", "--verify", "--quiet", "refs/heads/"+branch).Run()
+	return err == nil
 }
 
 // ---- skills ----
