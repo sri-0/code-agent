@@ -33,6 +33,7 @@ import (
 // Handler satisfies oreview.Handler.
 type Handler struct {
 	Runtimes map[string]runtime.Runtime // runtime name -> instance
+	Tasks    tasks.Store                // for persisting refreshed WorkerRef
 	LLM      *llm.Client                // may be nil; no-op if so
 	Logger   zerolog.Logger
 }
@@ -103,15 +104,139 @@ func (h *Handler) runChangeRequest(ctx context.Context, log zerolog.Logger, e or
 	return h.replyOnPR(ctx, log, e, text)
 }
 
+// ReactiveTurnInput is the input shape for RunReactiveTurn — invoked by
+// the reactions engine for ci-failed / changes-requested. It mirrors
+// the in-flight review-comment turn but doesn't have a parent comment
+// to thread under, so it operates on the dominant MR.
+type ReactiveTurnInput struct {
+	Task         *tasks.Task
+	Board        config.Board
+	Mode         string // "explore" | "build"
+	SystemPrompt string
+	UserMessage  string
+	PushOnEdit   bool
+}
+
+// RunReactiveTurn is the entry the reactions engine calls. Same code
+// path as Handle (ensure-worker → opencode session → prompt async →
+// wait turn → optional commit-push) but driven by a structured prompt
+// instead of a parsed PR comment.
+func (h *Handler) RunReactiveTurn(ctx context.Context, in ReactiveTurnInput) error {
+	if len(in.Task.MergeRequests) == 0 {
+		return fmt.Errorf("no MR on task; nothing to react against")
+	}
+	mr := dominantOpenMR(in.Task.MergeRequests)
+	if mr == nil {
+		return fmt.Errorf("no open MR on task")
+	}
+	log := h.Logger.With().
+		Str("task", in.Task.ID).
+		Str("repo", mr.Repo).
+		Str("mode", in.Mode).
+		Logger()
+
+	rtName := in.Board.RuntimeRef
+	rt, ok := h.Runtimes[rtName]
+	if !ok {
+		return fmt.Errorf("runtime %q not registered", rtName)
+	}
+	client, ref, err := rt.EnsureWorker(ctx, in.Task, in.Board)
+	if err != nil {
+		return fmt.Errorf("ensure worker: %w", err)
+	}
+	in.Task.WorkerRef = *ref
+	in.Task.RuntimeMode = rt.Mode()
+	if h.Tasks != nil {
+		saveCtx, cancelSave := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := h.Tasks.Update(saveCtx, in.Task); err != nil {
+			log.Warn().Err(err).Msg("persist refreshed worker ref failed")
+		}
+		cancelSave()
+	}
+
+	scoped := client.WithDirectory("/workspace/" + mr.Repo)
+	session, err := scoped.CreateSession(ctx, fmt.Sprintf("react %s %s", in.Task.ExternalID, mr.Repo))
+	if err != nil {
+		return fmt.Errorf("create session: %w", err)
+	}
+	submitStart := time.Now().UnixMilli()
+	agentMode := in.Mode
+	if agentMode == "" {
+		agentMode = "build"
+	}
+	if err := scoped.PostMessageAsync(ctx, session.ID, opencode.PostMessageRequest{
+		Agent:  agentMode,
+		System: in.SystemPrompt,
+		Parts:  []opencode.MessagePart{{Type: "text", Text: in.UserMessage}},
+	}); err != nil {
+		return fmt.Errorf("post prompt: %w", err)
+	}
+	turnCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	defer cancel()
+	turn, err := scoped.WaitForTurn(turnCtx, session.ID, submitStart)
+	if err != nil {
+		return fmt.Errorf("wait turn: %w", err)
+	}
+	if turn.Error != nil {
+		return fmt.Errorf("agent error: %s", turn.Error.Data.Message)
+	}
+
+	if !in.PushOnEdit {
+		return nil
+	}
+	// Push any new commits on the feature branch.
+	adminURL := in.Task.WorkerRef.AdminURL
+	if adminURL == "" {
+		return fmt.Errorf("no admin URL after EnsureWorker")
+	}
+	branch := mr.SourceBranch
+	if branch == "" {
+		branch = "ai/" + in.Task.ExternalID
+	}
+	commit := fmt.Sprintf("Auto-fix from %s reaction on %s", in.Mode, in.Task.ExternalID)
+	driver := actions.NewPodDriver(adminURL, log)
+	dirty, diff, err := driver.GetStatusAndDiff(ctx, mr.Repo)
+	if err != nil {
+		return err
+	}
+	if !dirty || strings.TrimSpace(diff) == "" {
+		log.Info().Msg("no new changes to commit after reaction turn")
+		return nil
+	}
+	return driver.CommitAndPush(ctx, mr.Repo, branch, "", commit)
+}
+
+func dominantOpenMR(mrs []tasks.MergeRef) *tasks.MergeRef {
+	for i := range mrs {
+		if mrs[i].State == "" || mrs[i].State == "open" {
+			return &mrs[i]
+		}
+	}
+	return nil
+}
+
 func (h *Handler) runAgent(ctx context.Context, log zerolog.Logger, e oreview.Event, agent, systemPrompt string) (string, error) {
 	rtName := e.Board.RuntimeRef
 	rt, ok := h.Runtimes[rtName]
 	if !ok {
 		return "", fmt.Errorf("runtime %q not registered", rtName)
 	}
-	client, _, err := rt.EnsureWorker(ctx, e.Task, e.Board)
+	client, ref, err := rt.EnsureWorker(ctx, e.Task, e.Board)
 	if err != nil {
 		return "", fmt.Errorf("ensure worker: %w", err)
+	}
+	// Refresh the task's WorkerRef in-memory + persist. The pod's
+	// admin/opencode ports change every restart (new SPDY port-forward),
+	// so the stale value in valkey must be updated before pushFeatureBranch
+	// uses it for the commit-push admin call.
+	e.Task.WorkerRef = *ref
+	e.Task.RuntimeMode = rt.Mode()
+	if h.Tasks != nil {
+		saveCtx, cancelSave := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := h.Tasks.Update(saveCtx, e.Task); err != nil {
+			log.Warn().Err(err).Msg("persist refreshed worker ref failed")
+		}
+		cancelSave()
 	}
 
 	// Scope every opencode call to the specific repo's directory via
@@ -189,7 +314,10 @@ func (h *Handler) replyOnPR(ctx context.Context, log zerolog.Logger, e oreview.E
 	ref := vcs.MergeRequest{Repo: e.MR.Repo, IID: e.MR.IID, Number: e.MR.Number, URL: e.MR.URL}
 	replyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	return client.ReplyToComment(replyCtx, ref, e.Comment, body)
+	// Append the bot-reply marker so the poller (which uses the same PAT
+	// as a real user might) doesn't loop on its own comments.
+	tagged := body + "\n\n" + oreview.BotReplyMarker
+	return client.ReplyToComment(replyCtx, ref, e.Comment, tagged)
 }
 
 // ---- prompts ----

@@ -14,7 +14,7 @@ package review
 
 import (
 	"context"
-	"sync"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -32,6 +32,14 @@ type Event struct {
 	Comment vcs.ReviewComment
 }
 
+// BotReplyMarker is embedded (as an HTML comment, invisible in rendered
+// PR/MR views) in every comment the orchestrator posts to a PR. Both the
+// poller and the open_mr action use this to identify their own replies
+// when skipping self-authored comments — author-based detection is
+// unreliable when the bot uses a human's PAT (its login is the human's
+// login, indistinguishable from the human's own comments).
+const BotReplyMarker = "<!-- code-agent:reply -->"
+
 // Handler is called synchronously per event. Returning an error does NOT
 // advance the cursor (the poller will retry on next tick); return nil for
 // processed-but-failed events you don't want re-attempted.
@@ -44,10 +52,6 @@ type Poller struct {
 	interval time.Duration
 	logger   zerolog.Logger
 	handler  Handler
-
-	// Per-(vcs,repo) bot identities resolved once on first use.
-	botMu   sync.Mutex
-	botIDs  map[string]string
 }
 
 func New(store tasks.Store, boards *config.BoardsConfig, interval time.Duration, logger zerolog.Logger, handler Handler) *Poller {
@@ -60,7 +64,6 @@ func New(store tasks.Store, boards *config.BoardsConfig, interval time.Duration,
 		interval: interval,
 		logger:   logger.With().Str("component", "review_poller").Logger(),
 		handler:  handler,
-		botIDs:   map[string]string{},
 	}
 }
 
@@ -117,7 +120,6 @@ func (p *Poller) processTask(ctx context.Context, board config.Board, t *tasks.T
 			p.logger.Debug().Err(err).Str("repo", mr.Repo).Msg("vcs.Build failed")
 			continue
 		}
-		botID := p.botIdentity(ctx, mr.Repo, client)
 		ref := vcs.MergeRequest{Repo: mr.Repo, IID: mr.IID, Number: mr.Number, URL: mr.URL}
 
 		listCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -135,8 +137,11 @@ func (p *Poller) processTask(ctx context.Context, board config.Board, t *tasks.T
 			if !c.CreatedAt.After(mr.LastCommentCursor) {
 				continue
 			}
-			if botID != "" && c.Author == botID {
-				// Our own reply — skip but still advance cursor.
+			// Skip comments we wrote ourselves — identified by an embedded
+			// HTML-comment marker, NOT by author login (author-based
+			// skipping breaks when the bot uses a human's PAT, since its
+			// login matches the human's own comments).
+			if strings.Contains(c.Body, BotReplyMarker) {
 				if c.CreatedAt.After(latest) {
 					latest = c.CreatedAt
 				}
@@ -175,26 +180,6 @@ func (p *Poller) processTask(ctx context.Context, board config.Board, t *tasks.T
 			p.logger.Warn().Err(err).Str("task", t.ID).Msg("persist cursor failed")
 		}
 	}
-}
-
-func (p *Poller) botIdentity(ctx context.Context, repoName string, client vcs.Client) string {
-	key := client.Provider() + "|" + repoName
-	p.botMu.Lock()
-	if id, ok := p.botIDs[key]; ok {
-		p.botMu.Unlock()
-		return id
-	}
-	p.botMu.Unlock()
-	idCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	id, err := client.BotIdentity(idCtx)
-	if err != nil {
-		p.logger.Debug().Err(err).Str("repo", repoName).Msg("bot identity lookup failed")
-	}
-	p.botMu.Lock()
-	p.botIDs[key] = id
-	p.botMu.Unlock()
-	return id
 }
 
 func findBoardRepo(b config.Board, name string) (config.BoardRepo, bool) {

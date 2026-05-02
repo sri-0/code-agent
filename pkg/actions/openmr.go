@@ -35,6 +35,7 @@ import (
 
 	"code-agent/internal/config"
 	"code-agent/pkg/llm"
+	"code-agent/pkg/review"
 	"code-agent/pkg/stages"
 	"code-agent/pkg/tasks"
 	"code-agent/pkg/vcs"
@@ -225,6 +226,9 @@ func (r *OpenMRRunner) crosslink(ctx context.Context, logger zerolog.Logger, mrs
 			}
 			b.WriteByte('\n')
 		}
+		// Marker so the review poller doesn't classify our own comment.
+		b.WriteString("\n")
+		b.WriteString(review.BotReplyMarker)
 		cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		c, ok := r.clients[mrs[i].Repo]
 		if !ok {

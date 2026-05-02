@@ -52,6 +52,16 @@ type Config struct {
 	// scans live pods. Must be smaller than the TTLs to be useful.
 	PodGCInterval time.Duration `env:"CODE_AGENT_POD_GC_INTERVAL,default=10m"`
 
+	// --- Notifications ---
+	// Mattermost — bot account; threading via root_id.
+	MattermostBaseURL          string `env:"CODE_AGENT_MATTERMOST_BASE_URL"`
+	MattermostToken            string `env:"CODE_AGENT_MATTERMOST_TOKEN"`
+	MattermostDefaultChannelID string `env:"CODE_AGENT_MATTERMOST_CHANNEL_ID"`
+	// Microsoft Teams — incoming webhook URL.
+	TeamsWebhookURL string `env:"CODE_AGENT_TEAMS_WEBHOOK_URL"`
+	// Generic webhook (POSTs JSON; useful for custom integrations).
+	GenericWebhookURL string `env:"CODE_AGENT_WEBHOOK_URL"`
+
 	// Attached after YAML load. No env tag — envconfig leaves them alone.
 	Boards   *BoardsConfig
 	Stages   *StagesConfig

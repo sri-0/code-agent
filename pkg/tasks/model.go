@@ -34,6 +34,17 @@ type Task struct {
 
 	MergeRequests []MergeRef `json:"merge_requests,omitempty"`
 
+	// Lifecycle is the canonical multi-track state (session × PR × runtime).
+	// Stage is derived from this via DeriveStage. Synthesised on first read
+	// from the legacy fields when missing — see EnsureLifecycle.
+	Lifecycle Lifecycle `json:"lifecycle,omitempty"`
+
+	// ReactionLedger records the last time each reaction key fired against
+	// this task ("ci-failed", "changes-requested", etc.) so the reactions
+	// engine doesn't re-fire on the same evidence within an escalation
+	// window. Keyed by reaction id; nil/empty until first firing.
+	ReactionLedger map[string]time.Time `json:"reaction_ledger,omitempty"`
+
 	LastEventKey string    `json:"last_event_key"` // dedupe marker (updated_at or event id)
 	LastSync     time.Time `json:"last_sync"`
 
