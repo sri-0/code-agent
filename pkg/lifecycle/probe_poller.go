@@ -125,7 +125,26 @@ func (p *ProbePoller) processTask(ctx context.Context, t *tasks.Task) {
 	if !lifecycleChanged(prev, t.Lifecycle) {
 		return
 	}
-	if err := p.tasks.Update(ctx, t); err != nil {
+	// Re-read + merge: another poller (PR) may have written a different
+	// part of the lifecycle since our ListByBoard. We own only the
+	// Runtime track, the Detect sub-state, and (when escalating) the
+	// Session.State on stuck/terminated transitions. Everything else on
+	// disk wins.
+	fresh, err := p.tasks.Get(ctx, t.ID)
+	if err != nil {
+		p.logger.Warn().Err(err).Str("task", t.ID).Msg("re-read for merge failed")
+		return
+	}
+	prevFresh := fresh.Lifecycle
+	tasks.EnsureLifecycle(fresh, time.Now())
+	fresh.Lifecycle.Runtime = t.Lifecycle.Runtime
+	fresh.Lifecycle.Detect = t.Lifecycle.Detect
+	if d.NextSession != "" {
+		fresh.Lifecycle.Session.State = t.Lifecycle.Session.State
+		fresh.Lifecycle.Session.Reason = t.Lifecycle.Session.Reason
+		fresh.Lifecycle.Session.LastTransitionAt = t.Lifecycle.Session.LastTransitionAt
+	}
+	if err := p.tasks.Update(ctx, fresh); err != nil {
 		p.logger.Warn().Err(err).Str("task", t.ID).Msg("persist probe lifecycle failed")
 		return
 	}
@@ -133,6 +152,6 @@ func (p *ProbePoller) processTask(ctx context.Context, t *tasks.Task) {
 		p.logger.Warn().Str("task", t.ID).Str("evidence", d.Evidence).Msg("agent stuck")
 	}
 	if p.onTransition != nil {
-		p.onTransition(ctx, t, prev, t.Lifecycle)
+		p.onTransition(ctx, fresh, prevFresh, fresh.Lifecycle)
 	}
 }

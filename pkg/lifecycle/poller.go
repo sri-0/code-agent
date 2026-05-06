@@ -169,18 +169,37 @@ func (p *PRPoller) processTask(ctx context.Context, board config.Board, t *tasks
 }
 
 func (p *PRPoller) persistAndNotify(ctx context.Context, t *tasks.Task, prev tasks.Lifecycle) {
-	if !lifecycleChanged(prev, t.Lifecycle) {
-		// Still write — ClosedAt/MergedAt fields may have moved on the
-		// MergeRef even when track state didn't.
-		_ = p.tasks.Update(ctx, t)
+	// Re-read + merge so we don't clobber the probe poller's Runtime/Detect
+	// writes (the two pollers tick concurrently and otherwise race).
+	fresh, err := p.tasks.Get(ctx, t.ID)
+	if err != nil {
+		p.logger.Warn().Err(err).Str("task", t.ID).Msg("re-read for merge failed")
 		return
 	}
-	if err := p.tasks.Update(ctx, t); err != nil {
+	prevFresh := fresh.Lifecycle
+	tasks.EnsureLifecycle(fresh, time.Now())
+	// Copy MergeRequests state (we may have refreshed it) and PR track.
+	fresh.MergeRequests = t.MergeRequests
+	fresh.Lifecycle.PR = t.Lifecycle.PR
+	// Session reason is owned partly by us (PRCreated, FixingCI,
+	// ResolvingReviewComments, MergedWaitingDecision, AwaitingExternalReview)
+	// — only overwrite when our applyOpenPRDecision actually changed it
+	// (i.e. prev.Session.Reason != current local Session.Reason).
+	if t.Lifecycle.Session.Reason != prev.Session.Reason {
+		fresh.Lifecycle.Session.State = t.Lifecycle.Session.State
+		fresh.Lifecycle.Session.Reason = t.Lifecycle.Session.Reason
+		fresh.Lifecycle.Session.LastTransitionAt = t.Lifecycle.Session.LastTransitionAt
+	}
+	changed := lifecycleChanged(prevFresh, fresh.Lifecycle)
+	if err := p.tasks.Update(ctx, fresh); err != nil {
 		p.logger.Warn().Err(err).Str("task", t.ID).Msg("persist lifecycle failed")
 		return
 	}
+	if !changed {
+		return
+	}
 	if p.onTransition != nil {
-		p.onTransition(ctx, t, prev, t.Lifecycle)
+		p.onTransition(ctx, fresh, prevFresh, fresh.Lifecycle)
 	}
 }
 

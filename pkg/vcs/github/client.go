@@ -141,13 +141,18 @@ func (c *client) GetCIStatus(ctx context.Context, ref vcs.MergeRequest) (vcs.CIS
 		return out, nil
 	}
 
+	pending := false
+	failing := false
+
+	// Checks API may 403 for fine-grained PATs without `Checks: read`
+	// permission. Don't abort — many repos surface CI through the
+	// combined Statuses API anyway, which we read below. Tolerate the
+	// failure and proceed.
 	checks, _, err := c.c.Checks.ListCheckRunsForRef(ctx, c.owner, c.repo, sha,
 		&gh.ListCheckRunsOptions{ListOptions: gh.ListOptions{PerPage: 100}})
 	if err != nil {
-		return out, fmt.Errorf("list check runs: %w", err)
+		checks = &gh.ListCheckRunsResults{}
 	}
-	pending := false
-	failing := false
 	for _, run := range checks.CheckRuns {
 		status := run.GetStatus()       // queued | in_progress | completed
 		conclusion := run.GetConclusion() // success | failure | neutral | cancelled | skipped | timed_out | action_required
