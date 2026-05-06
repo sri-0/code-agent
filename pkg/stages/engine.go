@@ -160,6 +160,10 @@ func (e *Engine) HandleEvent(ctx context.Context, evt providers.Event, board con
 		return err
 	}
 
+	// Ensure the canonical lifecycle is populated for tasks that pre-date
+	// the multi-track refactor; from here on all writers can rely on it.
+	tasks.EnsureLifecycle(t, time.Now())
+
 	// If the task is already in this stage and was recently processed,
 	// dedupe at the task level (covers webhook+poll overlap that escaped
 	// the dispatcher cache).
@@ -184,6 +188,16 @@ func (e *Engine) HandleEvent(ctx context.Context, evt providers.Event, board con
 	t.LastEventKey = evt.Key
 	t.LastSync = time.Now()
 	t.UpdatedAt = time.Now()
+	// Mirror onto the canonical lifecycle: entering any non-terminal stage
+	// means the agent is working again. Reason is the stage name itself so
+	// the UI can render a useful subtitle ("working: implement").
+	now := t.UpdatedAt
+	t.Lifecycle.Session.State = tasks.SessionStateWorking
+	t.Lifecycle.Session.Reason = tasks.SessionReason(stg.Name)
+	t.Lifecycle.Session.LastTransitionAt = &now
+	if t.Lifecycle.Session.StartedAt == nil {
+		t.Lifecycle.Session.StartedAt = &now
+	}
 	if err := e.store.Update(ctx, t); err != nil {
 		return fmt.Errorf("save before action: %w", err)
 	}
@@ -215,6 +229,7 @@ func (e *Engine) loadOrCreateTask(ctx context.Context, b config.Board, evt provi
 		RuntimeMode:  b.RuntimeRef, // resolved to a real mode at action time
 		CreatedAt:    now,
 		UpdatedAt:    now,
+		Lifecycle:    tasks.SynthesizeLifecycle(&tasks.Task{Stage: stg.Name, StageStarted: now}, now),
 	}
 	for _, r := range b.Repos {
 		t.Repos = append(t.Repos, tasks.RepoState{
@@ -357,6 +372,18 @@ func (e *Engine) advance(ctx context.Context, t *tasks.Task, b config.Board, stg
 	t.Stage = next.Name
 	t.StageStarted = time.Now()
 	t.UpdatedAt = time.Now()
+	// Update the lifecycle session track on every transition. Terminal
+	// stages handled above; here we always have a forward edge.
+	now := t.UpdatedAt
+	if next.Terminal {
+		t.Lifecycle.Session.State = tasks.SessionStateDone
+		t.Lifecycle.Session.Reason = tasks.SessionReasonResearchComplete
+		t.Lifecycle.Session.CompletedAt = &now
+	} else {
+		t.Lifecycle.Session.State = tasks.SessionStateWorking
+		t.Lifecycle.Session.Reason = tasks.SessionReason(next.Name)
+	}
+	t.Lifecycle.Session.LastTransitionAt = &now
 	// Clear the cached opencode session id so the next stage starts with a
 	// fresh session. Each stage has its own system prompt; we don't want
 	// the plan-stage conversation leaking into the implement-stage turn.

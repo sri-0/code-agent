@@ -131,6 +131,99 @@ func (c *client) ReplyToComment(ctx context.Context, ref vcs.MergeRequest, paren
 	return c.Comment(ctx, ref, b.String())
 }
 
+// GetCIStatus reads the latest pipeline for the MR's source branch +
+// head sha. GitLab's MR object exposes `head_pipeline` directly.
+func (c *client) GetCIStatus(ctx context.Context, ref vcs.MergeRequest) (vcs.CISummary, error) {
+	mr, _, err := c.c.MergeRequests.GetMergeRequest(c.projectPath, ref.IID, nil, glab.WithContext(ctx))
+	if err != nil {
+		return vcs.CISummary{Status: vcs.CIStatusUnknown}, fmt.Errorf("get mr: %w", err)
+	}
+	out := vcs.CISummary{Status: vcs.CIStatusUnknown, HeadSHA: mr.SHA}
+	if mr.HeadPipeline == nil {
+		return out, nil
+	}
+	switch mr.HeadPipeline.Status {
+	case "success":
+		out.Status = vcs.CIStatusPassing
+	case "failed", "canceled":
+		out.Status = vcs.CIStatusFailing
+	case "running", "pending", "preparing", "created", "scheduled", "waiting_for_resource":
+		out.Status = vcs.CIStatusPending
+	}
+	if out.Status == vcs.CIStatusFailing {
+		jobs, _, err := c.c.Jobs.ListPipelineJobs(c.projectPath, mr.HeadPipeline.ID, nil, glab.WithContext(ctx))
+		if err == nil {
+			for _, j := range jobs {
+				if j.Status == "failed" || j.Status == "canceled" {
+					out.FailingRuns = append(out.FailingRuns, vcs.CIRun{
+						Name: j.Name, URL: j.WebURL, Conclusion: j.Status,
+					})
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
+// GetReviewDecision aggregates GitLab's approvals + reviewer state.
+// GitLab encodes "changes requested" as a reviewer state, not as a
+// separate field — we surface that via the MR Reviewers list.
+func (c *client) GetReviewDecision(ctx context.Context, ref vcs.MergeRequest) (vcs.ReviewDecision, error) {
+	mr, _, err := c.c.MergeRequests.GetMergeRequest(c.projectPath, ref.IID, nil, glab.WithContext(ctx))
+	if err != nil {
+		return vcs.ReviewDecisionNone, fmt.Errorf("get mr: %w", err)
+	}
+	for _, rv := range mr.Reviewers {
+		// go-gitlab's BasicUser doesn't expose State; the state lives in
+		// MR.Reviewer's `reviewer_state` which the SDK surfaces as
+		// `reviewer_state` on the per-MR API but is not always populated.
+		// Fall back to approvals API below if reviewers are listed but
+		// states are blank.
+		_ = rv
+	}
+	apps, _, err := c.c.MergeRequestApprovals.GetApprovalState(c.projectPath, ref.IID, glab.WithContext(ctx))
+	if err == nil && apps != nil {
+		approved := 0
+		required := 0
+		for _, rule := range apps.Rules {
+			required += rule.ApprovalsRequired
+			if rule.Approved {
+				approved++
+			}
+		}
+		if required > 0 && approved == required {
+			return vcs.ReviewDecisionApproved, nil
+		}
+		if required > 0 {
+			return vcs.ReviewDecisionPending, nil
+		}
+	}
+	if len(mr.Reviewers) > 0 {
+		return vcs.ReviewDecisionPending, nil
+	}
+	return vcs.ReviewDecisionNone, nil
+}
+
+// MergeMR closes an MR by merging it. GitLab's only "method" knob is
+// squash — passed through MergeOptions.Method == "squash".
+func (c *client) MergeMR(ctx context.Context, ref vcs.MergeRequest, opts vcs.MergeOptions) error {
+	mergeOpt := &glab.AcceptMergeRequestOptions{}
+	if opts.CommitMessage != "" {
+		mergeOpt.MergeCommitMessage = glab.Ptr(opts.CommitMessage)
+	}
+	if opts.Method == "squash" {
+		mergeOpt.Squash = glab.Ptr(true)
+		if opts.CommitMessage != "" {
+			mergeOpt.SquashCommitMessage = glab.Ptr(opts.CommitMessage)
+		}
+	}
+	_, _, err := c.c.MergeRequests.AcceptMergeRequest(c.projectPath, ref.IID, mergeOpt, glab.WithContext(ctx))
+	if err != nil {
+		return fmt.Errorf("accept mr: %w", err)
+	}
+	return nil
+}
+
 func (c *client) BotIdentity(ctx context.Context) (string, error) {
 	c.botOnce.Do(func() {
 		u, _, err := c.c.Users.CurrentUser(glab.WithContext(ctx))

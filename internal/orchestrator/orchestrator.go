@@ -16,26 +16,34 @@ import (
 	"code-agent/internal/config"
 	"code-agent/pkg/actions"
 	reviewact "code-agent/pkg/actions/review"
+	"code-agent/pkg/lifecycle"
 	"code-agent/pkg/llm"
+	"code-agent/pkg/notifications"
 	"code-agent/pkg/providers"
 	_ "code-agent/pkg/providers/all" // register providers
+	"code-agent/pkg/reactions"
+	reactionactions "code-agent/pkg/reactions/actions"
 	"code-agent/pkg/review"
 	"code-agent/pkg/runtime"
 	_ "code-agent/pkg/runtime/all" // register runtimes
 	"code-agent/pkg/stages"
 	"code-agent/pkg/tasks"
 	"code-agent/pkg/transcript"
+	"code-agent/pkg/vcs"
 	_ "code-agent/pkg/vcs/all" // register vcs providers
 )
 
 type Orchestrator struct {
-	cfg          *config.Config
-	logger       zerolog.Logger
-	tasks        tasks.Store
-	tx           transcript.Store
-	disp         *providers.Dispatcher
-	engine       *stages.Engine
-	reviewPoller *review.Poller
+	cfg             *config.Config
+	logger          zerolog.Logger
+	tasks           tasks.Store
+	tx              transcript.Store
+	disp            *providers.Dispatcher
+	engine          *stages.Engine
+	reviewPoller    *review.Poller
+	lifecyclePoller *lifecycle.PRPoller
+	reactionsEngine *reactions.Engine
+	probePoller     *lifecycle.ProbePoller
 
 	runtimes    map[string]runtime.Runtime
 	agentRunner *runtime.AgentRunner
@@ -98,14 +106,75 @@ func New(cfg *config.Config, logger zerolog.Logger, taskStore tasks.Store, tx tr
 	if llmErr != nil {
 		o.logger.Warn().Err(llmErr).Msg("LLM client unavailable; PR review loop disabled")
 	}
+	reviewHandler := &reviewact.Handler{
+		Runtimes: o.runtimes,
+		Tasks:    taskStore,
+		LLM:      llmClient,
+		Logger:   o.logger,
+	}
 	if llmClient != nil {
-		reviewHandler := &reviewact.Handler{
-			Runtimes: o.runtimes,
-			LLM:      llmClient,
-			Logger:   o.logger,
-		}
 		o.reviewPoller = review.New(taskStore, cfg.Boards, cfg.PodGCInterval, o.logger, reviewHandler.Handle)
 	}
+
+	// Reactions engine: declarative event→action rules driven by lifecycle
+	// transitions. Decisions are pure config (auto/retries/escalateAfter);
+	// the LLM layer lives inside send-to-agent's prompt, not the routing.
+	notifRouter := buildNotificationRouter(cfg, o.logger, func(boardID string) (providers.BoardProvider, bool) {
+		return o.Provider(boardID)
+	}, cfg.Boards.ByID)
+	o.reactionsEngine = reactions.NewEngine(reactions.Deps{
+		Tasks:         taskStore,
+		Notifications: notifRouter,
+		Logger:        o.logger,
+	})
+	o.reactionsEngine.Register(&reactionactions.Notify{Router: notifRouter, Logger: o.logger})
+	o.reactionsEngine.Register(&reactionactions.AutoMerge{
+		MergeOptionsForKey: func(b config.Board, _ reactions.EventKey) vcs.MergeOptions {
+			method := "squash"
+			if rc, ok := b.Reactions[string(reactions.EventApprovedAndGreen)]; ok && rc.Method != "" {
+				method = rc.Method
+			}
+			return vcs.MergeOptions{Method: method}
+		},
+		Logger: o.logger,
+	})
+	// send-to-agent uses the review handler's RunReactiveTurn method
+	// as the underlying TurnRunner — same code path as the comment-driven
+	// review loop, just driven by a structured reaction prompt.
+	o.reactionsEngine.Register(&reactionactions.SendToAgent{
+		Runner: &reviewTurnAdapter{handler: reviewHandler, boards: cfg.Boards},
+		Logger: o.logger,
+	})
+
+	// Shared transition handler: derive reaction events and feed the
+	// reactions engine. Used by both the PR poller (PR/CI signals) and
+	// the probe poller (runtime liveness signals).
+	transitionFn := func(ctx context.Context, t *tasks.Task, prev, next tasks.Lifecycle) {
+		b, ok := cfg.Boards.ByID(t.BoardID)
+		if !ok {
+			return
+		}
+		for _, key := range reactions.DeriveEvents(prev, next) {
+			evidence := string(next.PR.Reason) + "|" + next.PR.URL + "|" + string(next.Session.State)
+			o.reactionsEngine.Process(ctx, reactions.Event{
+				Key:          key,
+				Task:         t,
+				Board:        b,
+				Prev:         prev,
+				Next:         next,
+				EvidenceHash: reactions.EvidenceHash(key, evidence),
+			})
+		}
+	}
+
+	// Lifecycle PR poller — refreshes Lifecycle.PR.Reason from CI +
+	// review state on every tick, then feeds prev/next snapshots into
+	// the reactions engine.
+	o.lifecyclePoller = lifecycle.NewPRPoller(taskStore, cfg.Boards, cfg.PodGCInterval, o.logger, transitionFn)
+
+	// Probe poller — checks runtime liveness (opencode reachable?) and
+	// applies the detecting → stuck escalation budget.
+	o.probePoller = lifecycle.NewProbePoller(taskStore, cfg.Boards, nil, nil, cfg.PodGCInterval, o.logger, transitionFn)
 
 	if cfg.Boards == nil {
 		o.logger.Warn().Msg("no boards configured; orchestrator idle")
@@ -122,6 +191,64 @@ func New(cfg *config.Config, logger zerolog.Logger, taskStore tasks.Store, tx tr
 		o.logger.Info().Str("board", b.ID).Str("provider", b.Provider).Msg("provider registered")
 	}
 	return o, nil
+}
+
+// reviewTurnAdapter wraps reviewact.Handler so it satisfies the
+// reactions actions.TurnRunner interface. It just looks up the board
+// for the task and forwards to RunReactiveTurn.
+type reviewTurnAdapter struct {
+	handler *reviewact.Handler
+	boards  *config.BoardsConfig
+}
+
+func (a *reviewTurnAdapter) RunTurn(ctx context.Context, in reactionactions.TurnInput) error {
+	if a.handler == nil {
+		return nil
+	}
+	b, ok := a.boards.ByID(in.BoardID)
+	if !ok {
+		return nil
+	}
+	return a.handler.RunReactiveTurn(ctx, reviewact.ReactiveTurnInput{
+		Task:         in.Task,
+		Board:        b,
+		Mode:         in.Mode,
+		SystemPrompt: in.SystemPrompt,
+		UserMessage:  in.UserMessage,
+		PushOnEdit:   in.PushOnEdit,
+	})
+}
+
+// buildNotificationRouter assembles a FanoutRouter from the configured
+// backends (Mattermost, Teams, generic webhook, ticket). Backends are
+// only added when their env vars are present, so a partially-configured
+// deployment fan-outs only to what's wired.
+func buildNotificationRouter(
+	cfg *config.Config,
+	logger zerolog.Logger,
+	providerForBoard func(string) (providers.BoardProvider, bool),
+	boardForID func(string) (config.Board, bool),
+) notifications.Router {
+	var backends []notifications.Notifier
+	if cfg.MattermostBaseURL != "" && cfg.MattermostToken != "" && cfg.MattermostDefaultChannelID != "" {
+		backends = append(backends, notifications.NewMattermost(
+			cfg.MattermostBaseURL, cfg.MattermostToken, cfg.MattermostDefaultChannelID,
+		))
+	}
+	if cfg.TeamsWebhookURL != "" {
+		backends = append(backends, notifications.NewTeams(cfg.TeamsWebhookURL))
+	}
+	if cfg.GenericWebhookURL != "" {
+		backends = append(backends, notifications.NewWebhook(cfg.GenericWebhookURL))
+	}
+	// Always include the ticket backend — preserves the existing
+	// failure-comment behaviour even with no chat backends configured.
+	backends = append(backends, &notifications.Ticket{
+		ProviderForBoard: providerForBoard,
+		BoardForID:       boardForID,
+		Logger:           logger,
+	})
+	return notifications.NewFanoutRouter(logger, notifications.DefaultRouting, backends...)
 }
 
 // Provider returns the provider registered for the board id, if any.
@@ -168,6 +295,12 @@ func (o *Orchestrator) Start(ctx context.Context) {
 	}
 	if o.reviewPoller != nil {
 		go o.reviewPoller.Start(ctx)
+	}
+	if o.lifecyclePoller != nil {
+		go o.lifecyclePoller.Start(ctx)
+	}
+	if o.probePoller != nil {
+		go o.probePoller.Start(ctx)
 	}
 	o.disp.StartPollers(ctx, interval)
 	go o.consume(ctx)

@@ -126,6 +126,146 @@ func (c *client) ReplyToComment(ctx context.Context, ref vcs.MergeRequest, paren
 	return c.Comment(ctx, ref, b.String())
 }
 
+// GetCIStatus rolls up GitHub Checks API + the legacy combined Statuses
+// API for the PR's head sha. Anything pending → pending; any failure →
+// failing; otherwise passing. We collect failing run names + URLs so the
+// `ci-failed` reaction has them in hand without re-querying.
+func (c *client) GetCIStatus(ctx context.Context, ref vcs.MergeRequest) (vcs.CISummary, error) {
+	pr, _, err := c.c.PullRequests.Get(ctx, c.owner, c.repo, ref.Number)
+	if err != nil {
+		return vcs.CISummary{Status: vcs.CIStatusUnknown}, fmt.Errorf("get pr: %w", err)
+	}
+	sha := pr.GetHead().GetSHA()
+	out := vcs.CISummary{Status: vcs.CIStatusUnknown, HeadSHA: sha}
+	if sha == "" {
+		return out, nil
+	}
+
+	pending := false
+	failing := false
+
+	// Checks API may 403 for fine-grained PATs without `Checks: read`
+	// permission. Don't abort — many repos surface CI through the
+	// combined Statuses API anyway, which we read below. Tolerate the
+	// failure and proceed.
+	checks, _, err := c.c.Checks.ListCheckRunsForRef(ctx, c.owner, c.repo, sha,
+		&gh.ListCheckRunsOptions{ListOptions: gh.ListOptions{PerPage: 100}})
+	if err != nil {
+		checks = &gh.ListCheckRunsResults{}
+	}
+	for _, run := range checks.CheckRuns {
+		status := run.GetStatus()       // queued | in_progress | completed
+		conclusion := run.GetConclusion() // success | failure | neutral | cancelled | skipped | timed_out | action_required
+		if status != "completed" {
+			pending = true
+			continue
+		}
+		switch conclusion {
+		case "failure", "timed_out", "action_required", "cancelled":
+			failing = true
+			out.FailingRuns = append(out.FailingRuns, vcs.CIRun{
+				Name: run.GetName(), URL: run.GetHTMLURL(), Conclusion: conclusion,
+			})
+		}
+	}
+
+	combined, _, err := c.c.Repositories.GetCombinedStatus(ctx, c.owner, c.repo, sha,
+		&gh.ListOptions{PerPage: 100})
+	if err == nil {
+		switch combined.GetState() {
+		case "pending":
+			pending = true
+		case "failure", "error":
+			failing = true
+			for _, st := range combined.Statuses {
+				if s := st.GetState(); s == "failure" || s == "error" {
+					out.FailingRuns = append(out.FailingRuns, vcs.CIRun{
+						Name: st.GetContext(), URL: st.GetTargetURL(), Conclusion: s,
+					})
+				}
+			}
+		}
+	}
+
+	switch {
+	case failing:
+		out.Status = vcs.CIStatusFailing
+	case pending:
+		out.Status = vcs.CIStatusPending
+	default:
+		out.Status = vcs.CIStatusPassing
+	}
+	return out, nil
+}
+
+// GetReviewDecision aggregates `pulls/{n}/reviews`. Latest review per
+// reviewer wins (mirrors GitHub UI semantics). If any reviewer asked for
+// changes → changes_requested; else if at least one approved →
+// approved; else if reviewers exist with no decision → pending; else none.
+func (c *client) GetReviewDecision(ctx context.Context, ref vcs.MergeRequest) (vcs.ReviewDecision, error) {
+	opts := &gh.ListOptions{PerPage: 100}
+	latest := map[string]string{} // login -> state
+	for {
+		reviews, resp, err := c.c.PullRequests.ListReviews(ctx, c.owner, c.repo, ref.Number, opts)
+		if err != nil {
+			return vcs.ReviewDecisionNone, fmt.Errorf("list reviews: %w", err)
+		}
+		for _, r := range reviews {
+			user := r.GetUser().GetLogin()
+			state := r.GetState() // APPROVED | CHANGES_REQUESTED | COMMENTED | DISMISSED | PENDING
+			if state == "COMMENTED" || state == "DISMISSED" || state == "PENDING" {
+				continue
+			}
+			latest[user] = state
+		}
+		if resp == nil || resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+
+	if len(latest) == 0 {
+		// No completed reviews. Distinguish between "reviewers were
+		// requested but haven't reviewed yet" (pending) and "nobody asked
+		// for review" (none).
+		pr, _, err := c.c.PullRequests.Get(ctx, c.owner, c.repo, ref.Number)
+		if err == nil && (len(pr.RequestedReviewers) > 0 || len(pr.RequestedTeams) > 0) {
+			return vcs.ReviewDecisionPending, nil
+		}
+		return vcs.ReviewDecisionNone, nil
+	}
+	approved := false
+	for _, state := range latest {
+		if state == "CHANGES_REQUESTED" {
+			return vcs.ReviewDecisionChangesRequested, nil
+		}
+		if state == "APPROVED" {
+			approved = true
+		}
+	}
+	if approved {
+		return vcs.ReviewDecisionApproved, nil
+	}
+	return vcs.ReviewDecisionPending, nil
+}
+
+// MergeMR closes a PR by merging it. Method defaults to "squash" — most
+// teams want a clean merge by default; override per board if needed.
+func (c *client) MergeMR(ctx context.Context, ref vcs.MergeRequest, opts vcs.MergeOptions) error {
+	method := opts.Method
+	if method == "" {
+		method = "squash"
+	}
+	_, _, err := c.c.PullRequests.Merge(ctx, c.owner, c.repo, ref.Number, opts.CommitMessage, &gh.PullRequestOptions{
+		MergeMethod: method,
+		CommitTitle: opts.CommitTitle,
+	})
+	if err != nil {
+		return fmt.Errorf("merge pr: %w", err)
+	}
+	return nil
+}
+
 func (c *client) BotIdentity(ctx context.Context) (string, error) {
 	c.botOnce.Do(func() {
 		u, _, err := c.c.Users.Get(ctx, "")

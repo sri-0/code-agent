@@ -36,6 +36,27 @@ type DeploymentSpec struct {
 	IngressHost      string
 	IngressTLSSecret string
 	IngressClassName string
+
+	// SecretMounts projects k8s Secrets into the pod filesystem. Used for
+	// per-repo .env files (one Secret per repo). Each mount lands at
+	// MountPath as a directory containing the Secret's keys as files.
+	SecretMounts []SecretMount
+}
+
+// SecretMount projects one k8s Secret into the worker pod. The Secret
+// must exist in the same namespace; missing Secrets cause the pod to
+// hang in ContainerCreating until the orchestrator creates them.
+type SecretMount struct {
+	// Name uniquely identifies this mount within the spec; used as the
+	// volume name. Letters/digits/dashes only.
+	Name string
+	// SecretName is the k8s Secret resource name.
+	SecretName string
+	// MountPath is where the secret's keys appear (e.g. /secrets/risky-api).
+	MountPath string
+	// Optional — if true, missing Secret won't block pod startup. Use
+	// only when the Secret may legitimately not exist yet.
+	Optional bool
 }
 
 // CreateDeployment creates Deployment + ClusterIP Service + optional Ingress.
@@ -54,6 +75,26 @@ func (c *Client) CreateDeployment(ctx context.Context, s DeploymentSpec) error {
 		envVars = append(envVars, corev1.EnvVar{Name: k, Value: v})
 	}
 
+	volumes := make([]corev1.Volume, 0, len(s.SecretMounts))
+	mounts := make([]corev1.VolumeMount, 0, len(s.SecretMounts))
+	for _, m := range s.SecretMounts {
+		opt := m.Optional
+		volumes = append(volumes, corev1.Volume{
+			Name: m.Name,
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: m.SecretName,
+					Optional:   &opt,
+				},
+			},
+		})
+		mounts = append(mounts, corev1.VolumeMount{
+			Name:      m.Name,
+			MountPath: m.MountPath,
+			ReadOnly:  true,
+		})
+	}
+
 	dep := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      s.Name,
@@ -66,11 +107,13 @@ func (c *Client) CreateDeployment(ctx context.Context, s DeploymentSpec) error {
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: s.Labels},
 				Spec: corev1.PodSpec{
+					Volumes: volumes,
 					Containers: []corev1.Container{{
-						Name:  "opencode",
-						Image: s.Image,
-						Env:   envVars,
-						Ports: containerPorts(s.Port, s.AdminPort),
+						Name:         "opencode",
+						Image:        s.Image,
+						Env:          envVars,
+						Ports:        containerPorts(s.Port, s.AdminPort),
+						VolumeMounts: mounts,
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
 								corev1.ResourceCPU:    resource.MustParse(orDefault(s.CPURequest, "200m")),

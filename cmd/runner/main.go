@@ -104,6 +104,14 @@ func main() {
 			if extID != "" && branchPrefix != "" {
 				resumeAgentBranch(dest, r.Name, branchPrefix+extID)
 			}
+			// Materialise the per-repo .env (and any declared extras) into
+			// the repo workspace. Driven by CODE_AGENT_REPO_ENV_<NAME>
+			// (mounted file path) and CODE_AGENT_REPO_EXTRAS_<NAME> (csv
+			// of file basenames). No-op if neither is set; failures are
+			// warnings (repo still usable, agent just lacks secrets).
+			if err := materialiseRepoEnv(dest, r.Name); err != nil {
+				logf("warn: env materialise %s: %v", r.Name, err)
+			}
 		}
 	}
 	if err := writeOpenCodeConfig(repos, eager); err != nil {
@@ -534,6 +542,95 @@ func parseRepos(s string) ([]repo, error) {
 		out = append(out, repo{Name: name, URL: repoURL, BaseBranch: branch})
 	}
 	return out, nil
+}
+
+// materialiseRepoEnv copies a per-repo .env (and optional extras) from a
+// k8s Secret mount or host path into the repo workspace. Driven by:
+//
+//	CODE_AGENT_REPO_ENV_<UPPER_NAME>      — abs path to the .env source
+//	CODE_AGENT_REPO_EXTRAS_<UPPER_NAME>   — csv of additional basenames
+//	                                        sitting alongside the .env
+//
+// Both are set by the orchestrator (persistent runtime adds Secret
+// volume mounts; local runtime points directly at the host path).
+//
+// Files land at <dest>/.env (mode 0600) and <dest>/<extra> (preserving
+// the source mode bits up to 0644). We *copy* rather than symlink because
+// a) symlinks across mount boundaries can confuse some tools and
+// b) some tools (uv, dotenv) follow .env via relative paths and break
+// on absolute symlinks pointing into /secrets.
+func materialiseRepoEnv(dest, repoName string) error {
+	upper := strings.ToUpper(strings.ReplaceAll(repoName, "-", "_"))
+	envSrc := os.Getenv("CODE_AGENT_REPO_ENV_" + upper)
+	extras := os.Getenv("CODE_AGENT_REPO_EXTRAS_" + upper)
+
+	if envSrc != "" {
+		if err := copyFileAtomic(envSrc, filepath.Join(dest, ".env"), 0o600); err != nil {
+			return fmt.Errorf("copy .env: %w", err)
+		}
+		logf("repo %s: materialised .env from %s", repoName, envSrc)
+	}
+
+	if extras != "" {
+		// Extras share the same parent directory as the env source. If
+		// no env source was given, fall back to a sibling dir
+		// CODE_AGENT_REPO_EXTRA_DIR_<NAME>.
+		extraDir := ""
+		if envSrc != "" {
+			extraDir = filepath.Dir(envSrc)
+		} else if dir := os.Getenv("CODE_AGENT_REPO_EXTRA_DIR_" + upper); dir != "" {
+			extraDir = dir
+		}
+		if extraDir == "" {
+			return fmt.Errorf("extras configured but no source dir resolvable")
+		}
+		for _, name := range strings.Split(extras, ",") {
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			src := filepath.Join(extraDir, name)
+			dst := filepath.Join(dest, name)
+			if err := copyFileAtomic(src, dst, 0o644); err != nil {
+				return fmt.Errorf("copy %s: %w", name, err)
+			}
+			logf("repo %s: materialised extra %s", repoName, name)
+		}
+	}
+	return nil
+}
+
+// copyFileAtomic writes src to dst via a temp file + rename. Final mode
+// is min(srcMode, requested) so we don't loosen permissions but do
+// tighten them for sensitive files like .env.
+func copyFileAtomic(src, dst string, mode os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	tmp, err := os.CreateTemp(filepath.Dir(dst), ".env-tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		if tmp != nil {
+			_ = tmp.Close()
+		}
+		_ = os.Remove(tmpPath)
+	}()
+	if _, err := io.Copy(tmp, in); err != nil {
+		return err
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	tmp = nil
+	return os.Rename(tmpPath, dst)
 }
 
 func cloneRepo(r repo, dest string) error {

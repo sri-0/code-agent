@@ -118,14 +118,18 @@ func (r *Runtime) EnsureWorker(ctx context.Context, t *tasks.Task, b config.Boar
 				env["CODE_AGENT_OPENCODE_CONFIG"] = string(j)
 			}
 		}
+		// Per-repo .env injection — mount Secrets + add env vars
+		// pointing cmd/runner at the mounted file paths.
+		secretMounts := buildRepoSecretMounts(b, env)
 		spec := k8s.DeploymentSpec{
-			Name:      depName,
-			Namespace: r.cfg.Namespace,
-			Image:     r.cfg.Image,
-			Labels:    labels,
-			Env:       env,
-			Port:      4096,
-			AdminPort: 4100,
+			Name:         depName,
+			Namespace:    r.cfg.Namespace,
+			Image:        r.cfg.Image,
+			Labels:       labels,
+			Env:          env,
+			Port:         4096,
+			AdminPort:    4100,
+			SecretMounts: secretMounts,
 		}
 		if r.cfg.Resources != nil {
 			spec.CPURequest = r.cfg.Resources.Requests.CPU
@@ -541,6 +545,74 @@ func ingressNameIfEnabled(host, name string) string {
 		return ""
 	}
 	return name
+}
+
+// buildRepoSecretMounts walks board.Repos and:
+//  1. For every repo with EnvRef like "secret://<name>", returns a
+//     SecretMount projecting that Secret at /secrets/<repo>/.
+//  2. Adds CODE_AGENT_REPO_ENV_<UPPER_NAME> + CODE_AGENT_REPO_EXTRAS_<UPPER_NAME>
+//     env vars so cmd/runner knows where to copy from.
+//
+// Mutates env map in place. Returns the SecretMount list to attach to the
+// pod spec.
+func buildRepoSecretMounts(b config.Board, env map[string]string) []k8s.SecretMount {
+	var mounts []k8s.SecretMount
+	for _, repo := range b.Repos {
+		secretName, ok := parseSecretRef(repo.EnvRef)
+		if !ok && len(repo.ExtraFiles) == 0 {
+			continue
+		}
+		if !ok {
+			// Has extras but no EnvRef — currently unsupported (no
+			// Secret to mount the extras from). Operators should declare
+			// EnvRef even if .env is empty, or use a future fileset
+			// schema.
+			continue
+		}
+		envKey := envSafeRepoName(repo.Name)
+		mountPath := "/secrets/" + repo.Name
+		mounts = append(mounts, k8s.SecretMount{
+			Name:       "repo-env-" + sanitiseDNS(repo.Name),
+			SecretName: secretName,
+			MountPath:  mountPath,
+		})
+		env["CODE_AGENT_REPO_ENV_"+envKey] = mountPath + "/.env"
+		if len(repo.ExtraFiles) > 0 {
+			env["CODE_AGENT_REPO_EXTRAS_"+envKey] = strings.Join(repo.ExtraFiles, ",")
+			env["CODE_AGENT_REPO_EXTRA_DIR_"+envKey] = mountPath
+		}
+	}
+	return mounts
+}
+
+// parseSecretRef extracts the secret name from a "secret://<name>" ref.
+// Returns false for empty or non-secret schemes (file://, etc — those
+// are local-runtime concerns and don't need k8s mounts).
+func parseSecretRef(ref string) (string, bool) {
+	const prefix = "secret://"
+	if !strings.HasPrefix(ref, prefix) {
+		return "", false
+	}
+	name := strings.TrimPrefix(ref, prefix)
+	if name == "" {
+		return "", false
+	}
+	return name, true
+}
+
+// envSafeRepoName converts "risky-coreapi" → "RISKY_COREAPI" for use in
+// CODE_AGENT_REPO_ENV_<NAME>-style env-var keys.
+func envSafeRepoName(name string) string {
+	return strings.ToUpper(strings.ReplaceAll(name, "-", "_"))
+}
+
+// sanitiseDNS makes a string DNS-1123-compatible for k8s Volume names.
+// Lowercases, replaces underscores with dashes; assumes input is mostly
+// safe already.
+func sanitiseDNS(name string) string {
+	out := strings.ToLower(name)
+	out = strings.ReplaceAll(out, "_", "-")
+	return out
 }
 
 func randPassword() string {
